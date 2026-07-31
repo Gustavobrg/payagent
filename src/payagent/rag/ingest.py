@@ -42,6 +42,17 @@ POLICIES_COLLECTION = "policies"
 EMBEDDING_DIM = 2048  # nvidia/nemotron-3-embed-1b output dimension
 
 
+def catalog_point_id(chunk_id: str) -> int:
+    """Deterministic Qdrant point ID for a chunk_id.
+
+    Defined here, next to the ingestion that assigns it, because every exact-lookup path
+    (`rag.tools.get_sku_details`, `mcp_server.catalog.lookup_sku`) has to reproduce the same
+    scheme to find a point without embedding a query. One definition means one edit if the
+    scheme ever changes.
+    """
+    return int(uuid5(NAMESPACE_URL, chunk_id).int % (2**63 - 1))
+
+
 class Embedder(ABC):
     """Abstract interface for embedding text."""
 
@@ -344,7 +355,7 @@ def ingest_chunks(
     points = []
     for chunk, embedding in zip(chunks, embeddings, strict=True):
         # Idempotent ID: uuid5(NAMESPACE_URL, chunk_id).
-        point_id = int(uuid5(NAMESPACE_URL, chunk["chunk_id"]).int % (2**63 - 1))
+        point_id = catalog_point_id(chunk["chunk_id"])
 
         point = PointStruct(
             id=point_id,

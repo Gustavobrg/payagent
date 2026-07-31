@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-import pytest
-
 from payagent.rag.ingest import (
     CATALOG_COLLECTION,
     DeterministicEmbedder,

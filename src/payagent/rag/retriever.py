@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
@@ -124,9 +123,9 @@ class Retriever:
     def __init__(
         self,
         qdrant_url: str = "http://localhost:6333",
-        client: Optional[QdrantClient] = None,
-        embedder: Optional[Embedder] = None,
-        reranker: Optional[Reranker] = None,
+        client: QdrantClient | None = None,
+        embedder: Embedder | None = None,
+        reranker: Reranker | None = None,
         use_deterministic_embedder: bool = False,
     ):
         """Initialize retriever with a Qdrant client, embedder, and reranker.
@@ -152,7 +151,7 @@ class Retriever:
         self,
         collection: str,
         query: str,
-        filters: Optional[dict] = None,
+        filters: dict | None = None,
         top_k: int = 8,
     ) -> list[RetrievedChunk]:
         """Search collection by query with optional filtering and reranking.
@@ -218,7 +217,7 @@ class Retriever:
 
         return result
 
-    def _build_filter(self, collection: str, filters: Optional[dict]) -> Optional[Filter]:
+    def _build_filter(self, collection: str, filters: dict | None) -> Filter | None:
         """Build a Qdrant filter from a filters dict.
 
         Raises ValueError if `filters` has a key not recognized for `collection`,
