@@ -1,0 +1,57 @@
+[project]
+name = "payagent-guard"
+version = "0.1.0"
+description = "Agente autônomo de compra com RAG agêntico, MCP tools, mandatos assinados e guardrails em camadas"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "langgraph",
+    "langchain-openai",
+    "mcp",
+    "nemoguardrails",
+    "qdrant-client",
+    "presidio-analyzer",
+    "presidio-anonymizer",
+    "pyjwt[crypto]",
+    "cryptography",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp",
+    "langfuse",
+    "structlog",
+    "httpx",
+    "pyyaml",
+    "python-dotenv>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "ragas",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/payagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["payagent"]
