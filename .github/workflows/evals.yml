@@ -12,9 +12,10 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run pytest -q
-      # Gate: implementado no bloco 9.
-      # O harness sai com codigo != 0 se false_settlement_rate > 0 ou pan_leak_count > 0.
-      - run: uv run python -m evals.harness.run --fail-on-regression
+      # TODO(bloco 9): evals/harness/run.py ainda nao existe. Reativar este step
+      # (uv run python -m evals.harness.run --fail-on-regression) quando o harness
+      # for implementado - ele deve sair com codigo != 0 se false_settlement_rate > 0
+      # ou pan_leak_count > 0.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
