@@ -6,14 +6,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      - run: pip install -e ".[dev]"
-      - run: pytest -q
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest -q
       # Gate: implementado no bloco 9.
       # O harness sai com codigo != 0 se false_settlement_rate > 0 ou pan_leak_count > 0.
-      - run: python -m evals.harness.run --fail-on-regression
+      - run: uv run python -m evals.harness.run --fail-on-regression
       - uses: actions/upload-artifact@v4
         if: always()
         with:
