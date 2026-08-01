@@ -1,8 +1,11 @@
-"""Tests for the minimal graph skeleton: node order, placeholders, illegal transitions.
+"""Tests for the purchase graph's wiring: node order, `PurchaseGraph.run`/`step`, illegal
+transitions, and one end-to-end happy path through every real node.
 
-Not the functional graph (plan/quote/mandate/confirm/settle are pass-throughs until
-bloco 4) — these tests only lock down the wiring contract: fixed order, placeholders
-that truly do nothing, `retrieve` is real, and out-of-order/unknown steps raise.
+Per-node business logic (policy denial reasons, step-up pausing, "only quote writes value",
+...) is covered in `tests/test_plan_node.py`, `test_quote_node.py`, `test_mandate_node.py`,
+`test_confirm_node.py`, and `test_settle_node.py`. This file only locks down the graph-level
+contract: fixed order, `retrieve` is real, `plan` degrades safely, and every node refuses to
+run out of order.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
+from doubles import AllowAllPolicyEngine, AlwaysVerifyingAuthority
 from langchain_core.messages import AIMessage
 from qdrant_client import QdrantClient
 
@@ -49,7 +53,12 @@ def retriever() -> Retriever:
 
 @dataclass
 class FakeChatModel:
-    """Replays `responses` in order, one per `.invoke()` call. Ignores message content."""
+    """Replays `responses` in order, one per `.invoke()` call. Ignores message content.
+
+    One instance backs both `plan` (routing) and `retrieve` (the sub-agent loop) when passed
+    to `build_graph` — `bind_tools` ignores its argument and returns `self`, so responses are
+    consumed strictly in call order regardless of which node is asking.
+    """
 
     responses: list[AIMessage]
     _index: int = field(default=0)
@@ -71,6 +80,10 @@ def _final_message() -> AIMessage:
     return AIMessage(content="")
 
 
+def _route_to_retrieve() -> AIMessage:
+    return _tool_call_message("route_decision", {"route": "retrieve"}, call_id="route-1")
+
+
 def test_node_order_matches_the_state_machine_invariant():
     assert NODE_ORDER == ("plan", "retrieve", "quote", "mandate", "confirm", "settle")
 
@@ -80,57 +93,120 @@ def test_build_graph_rejects_incomplete_node_set():
         PurchaseGraph(nodes={"plan": lambda s: s})
 
 
-def test_run_through_unknown_step_raises(retriever: Retriever):
-    graph = build_graph(FakeChatModel(responses=[_final_message()]), retriever)
+def test_run_through_unknown_step_raises(retriever: Retriever, deps):
+    graph = build_graph(FakeChatModel(responses=[]), retriever, deps)
     state = PurchaseState(user_request="fone bluetooth")
 
     with pytest.raises(IllegalTransitionError):
         graph.run(state, through="checkout")
 
 
-def test_placeholders_pass_state_through_unchanged(retriever: Retriever):
+def test_step_runs_a_single_named_node(retriever: Retriever, deps):
+    """The out-of-band entry point `scripts/demo.py` needs to pause and resume mid-graph."""
+    graph = build_graph(FakeChatModel(responses=[_route_to_retrieve()]), retriever, deps)
+    state = PurchaseState(user_request="fone bluetooth")
+
+    result = graph.step("plan", state)
+
+    assert result.status == "in_progress"
+
+
+def test_step_with_an_unknown_name_raises(retriever: Retriever, deps):
+    graph = build_graph(FakeChatModel(responses=[]), retriever, deps)
+    state = PurchaseState(user_request="fone bluetooth")
+
+    with pytest.raises(IllegalTransitionError):
+        graph.step("checkout", state)
+
+
+def test_plan_degrades_to_in_progress_when_the_model_makes_no_routing_call(
+    retriever: Retriever, deps
+):
+    """If the model doesn't call `route_decision` at all, `plan` fails toward retrieval."""
     llm = FakeChatModel(responses=[_final_message()])
-    graph = build_graph(llm, retriever)
+    graph = build_graph(llm, retriever, deps)
     state = PurchaseState(user_request="fone bluetooth")
 
     result = graph.run(state, through="plan")
 
-    assert result == state
-    assert result.retrieved_chunks == []
+    assert result.status == "in_progress"
+    assert result.direct_response is None
 
 
-def test_full_pipeline_only_retrieve_populates_state(retriever: Retriever):
+def test_retrieve_step_populates_state_and_nothing_past_it_runs(retriever: Retriever, deps):
     llm = FakeChatModel(
         responses=[
+            _route_to_retrieve(),
             _tool_call_message("search_catalog", {"query": "bluetooth speaker"}),
             _final_message(),
         ]
     )
-    graph = build_graph(llm, retriever)
-    state = PurchaseState(user_request="fone bluetooth")
-
-    result = graph.run(state)
-
-    assert result.retrieval_confidence == "high"
-    assert any(c.chunk_id == "SKU-SPEAKER" for c in result.retrieved_chunks)
-    # quote/mandate/confirm/settle are still placeholders — untouched.
-    assert result.quote is None
-    assert result.mandate is None
-    assert result.policy_decision is None
-    assert result.settlement_result is None
-
-
-def test_run_stops_after_through_step(retriever: Retriever):
-    llm = FakeChatModel(
-        responses=[
-            _tool_call_message("search_catalog", {"query": "bluetooth speaker"}),
-            _final_message(),
-        ]
-    )
-    graph = build_graph(llm, retriever)
+    graph = build_graph(llm, retriever, deps)
     state = PurchaseState(user_request="fone bluetooth")
 
     result = graph.run(state, through="retrieve")
 
+    assert result.status == "in_progress"
     assert result.retrieval_confidence == "high"
+    assert any(c.chunk_id == "SKU-SPEAKER" for c in result.retrieved_chunks)
     assert result.quote is None
+    assert result.mandate is None
+
+
+def test_retrieve_does_not_run_once_plan_has_answered_directly(retriever: Retriever, deps):
+    llm = FakeChatModel(
+        responses=[_tool_call_message("route_decision", {"route": "direct_response", "response": "Oi!"})]
+    )
+    graph = build_graph(llm, retriever, deps)
+    state = PurchaseState(user_request="oi")
+
+    result = graph.run(state, through="retrieve")
+
+    assert result.status == "answered_directly"
+    assert result.direct_response == "Oi!"
+    assert result.retrieved_chunks == []  # retrieve never ran
+
+
+def test_running_past_retrieve_without_a_confirmed_selection_is_an_illegal_transition(
+    retriever: Retriever, deps
+):
+    """`quote` requires a human-confirmed `selected_sku` — `retrieve` alone never sets one."""
+    llm = FakeChatModel(
+        responses=[
+            _route_to_retrieve(),
+            _tool_call_message("search_catalog", {"query": "bluetooth speaker"}),
+            _final_message(),
+        ]
+    )
+    graph = build_graph(llm, retriever, deps)
+    state = PurchaseState(user_request="fone bluetooth")
+
+    with pytest.raises(IllegalTransitionError):
+        graph.run(state, through="quote")
+
+
+def test_full_pipeline_settles_when_everything_is_pre_confirmed_and_permissive(
+    retriever: Retriever, build_deps
+):
+    """One end-to-end happy path through all six real nodes."""
+    llm = FakeChatModel(
+        responses=[
+            _route_to_retrieve(),
+            _tool_call_message("search_catalog", {"query": "bluetooth speaker"}),
+            _final_message(),
+        ]
+    )
+    deps = build_deps(policy=AllowAllPolicyEngine(), mandate_authority=AlwaysVerifyingAuthority())
+    graph = build_graph(llm, retriever, deps)
+    state = PurchaseState(
+        user_request="fone bluetooth",
+        selected_sku="SKU-SPEAKER",
+        selected_quantity=1,
+    )
+
+    result = graph.run(state)
+
+    assert result.status == "settled"
+    assert result.quote_amount_cents == 4999
+    assert result.settlement_result["data"]["amount_cents"] == 4999
+    assert result.mandate["data"]["payment_mandate_id"]

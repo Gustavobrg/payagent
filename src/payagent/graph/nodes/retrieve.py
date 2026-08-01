@@ -8,10 +8,13 @@ tool (those bindings simply don't exist in its tool list). It hands the *next* n
 flat list of citable chunks; turning those into a grounded response with citations
 (invariant I4) is `quote`'s job, not this one's.
 
-The sub-agent gets at most `max_iterations` LLM turns. If it never volunteers a stop
-(no more tool calls) within that budget, or the LLM call itself fails, the node returns
-whatever chunks it already collected with `confidence="low"` rather than raising or
-looping forever — a bounded sub-agent that can degrade is safer than one that can hang.
+The sub-agent gets at most `max_iterations` LLM turns; if it never volunteers a stop (no
+more tool calls) within that budget, or the LLM call itself fails, it returns whatever
+chunks it already collected rather than raising or looping forever — a bounded sub-agent
+that can degrade is safer than one that can hang. `confidence` reports whether that result
+is usable at all (`"high"` if at least one chunk came back, `"low"` if none did); it is not
+a proxy for "the model said it was satisfied" — see `run_retrieval_subagent` for why that
+would have made it read "low" almost every time.
 """
 
 from __future__ import annotations
@@ -263,12 +266,20 @@ def run_retrieval_subagent(
             messages.append(ToolMessage(content=content, tool_call_id=call["id"]))
 
     chunks = list(collected.values())
-    confidence: Literal["high", "low"] = "low" if (hit_iteration_limit or not chunks) else "high"
+    # Confidence tracks whether anything usable came back, not whether the model happened to
+    # emit an explicit stop message. Many models — especially smaller/free ones — rarely
+    # volunteer a bare "I'm done" turn once tools are bound, and will make one more (often
+    # redundant) tool call even after finding exactly what was needed; tying confidence to
+    # that meant it read "low" almost always, which made the signal noise instead of
+    # information. Hitting the iteration budget is still visible in `iterations_used` for
+    # anyone who wants it, but it no longer downgrades a result that actually found something.
+    confidence: Literal["high", "low"] = "high" if chunks else "low"
 
     logger.info(
         "retrieve_subagent_done",
         query_length=len(query),
         iterations_used=iterations_used,
+        hit_iteration_limit=hit_iteration_limit,
         chunks=len(chunks),
         confidence=confidence,
     )

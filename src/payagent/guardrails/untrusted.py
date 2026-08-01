@@ -46,3 +46,24 @@ def wrap_untrusted(
     )
     close_tag = f"</untrusted-retrieved-content:{nonce}>"
     return f"{open_tag}\n{UNTRUSTED_NOTICE}\n{text}\n{close_tag}"
+
+
+def unwrap_untrusted_text(wrapped: str) -> str:
+    """Strip the delimiter/notice back off, for showing retrieved prose to a human.
+
+    Display-only. The result must never feed back into agent reasoning, a price, or a
+    routing decision — that round trip (LLM output -> parsed -> trusted) is exactly what the
+    wrapper exists to prevent. This exists only so a human-facing surface
+    (`scripts/demo.py`, `scripts/demo_gradio.py`) can show a shopper "AuraSound Pro Wireless
+    Headphones. Great audio quality..." instead of the raw tagged block. The inverse of
+    `wrap_untrusted` lives next to it so both know the wire format the same way; a second,
+    independent parser drifting from it would silently start showing the wrong thing (or
+    nothing) the day the wrapper's shape changes.
+
+    Returns `wrapped` unchanged if it doesn't look like output of `wrap_untrusted` — never
+    raises on unexpected input, since this only feeds a UI label.
+    """
+    lines = wrapped.split("\n")
+    if len(lines) >= 4 and lines[0].startswith("<untrusted-retrieved-content:"):
+        return "\n".join(lines[2:-1])
+    return wrapped

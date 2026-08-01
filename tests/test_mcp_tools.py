@@ -14,6 +14,7 @@ building a live `ServerSession`.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from doubles import (
@@ -843,6 +844,48 @@ def test_execute_settlement_schema_has_no_field_that_can_assert_step_up():
             expected_currency="BRL",
             step_up_satisfied=True,  # type: ignore[call-arg]
         )
+
+
+@pytest.mark.parametrize("tool", VALID_ARGUMENTS.keys())
+@pytest.mark.parametrize("field_name", ["step_up_token", "user_confirmed"])
+async def test_no_tool_call_can_smuggle_step_up_through_any_argument_shape(
+    deps, tool: str, field_name: str
+):
+    """P5, black-box: this field must not exist on any of the six tools' schemas.
+
+    If it ever does, this starts passing schema validation — which is the regression this test
+    exists to catch — and step-up would be one caller-supplied argument away from bypassed,
+    regardless of how `deps.step_up` or the policy engine behave.
+    """
+    arguments = {**VALID_ARGUMENTS[tool], field_name: True}
+
+    result = await dispatch_tool_call(deps, tool, arguments)
+
+    error = _error(result)
+    assert error["code"] == "INVALID_ARGUMENTS"
+    assert any(fe["path"] == field_name for fe in error["field_errors"])
+
+
+def test_handlers_never_call_policy_engine_decide_directly():
+    """I1's boundary at the call site: only `payagent.policy.evaluate` may reach `engine.decide`.
+
+    A direct `.decide(` call in `handlers.py` would bypass the fail-closed funnel — `evaluate()`
+    is what turns a raising, malformed, or grant-mismatched engine into a `Deny` — so a
+    misbehaving or half-written engine's raw return value could reach a handler unguarded.
+    Grepping the source is deliberate: an import-based check could be fooled by an alias
+    (`from payagent.policy.engine import PolicyEngine as X; X.decide(...)`), and the property
+    that actually matters is that the literal call never appears.
+    """
+    source = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "payagent"
+        / "mcp_server"
+        / "handlers.py"
+    ).read_text(encoding="utf-8")
+
+    assert ".decide(" not in source
+    assert "evaluate(" in source
 
 
 async def test_settlement_above_the_stepup_threshold_is_denied_without_out_of_band_resolution(

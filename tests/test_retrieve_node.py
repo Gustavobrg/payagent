@@ -129,8 +129,15 @@ def test_only_exposes_the_four_read_only_tools(retriever: Retriever):
     }
 
 
-def test_hits_iteration_limit_without_natural_stop_returns_low_confidence(retriever: Retriever):
-    """Agent keeps requesting tools forever; the loop must still terminate at max_iterations."""
+def test_hitting_the_iteration_limit_still_terminates_and_keeps_high_confidence_if_it_found_something(
+    retriever: Retriever,
+):
+    """Agent keeps requesting tools forever; the loop must still terminate at max_iterations.
+
+    Confidence stays "high" here: real chunks came back, and many models never emit a bare
+    stop turn once tools are bound, so tying confidence to that would make it read "low"
+    for a search that actually succeeded — see `run_retrieval_subagent`'s comment.
+    """
     llm = FakeChatModel(
         responses=[
             _tool_call_message("search_catalog", {"query": "headphones"}, call_id=f"call-{i}")
@@ -141,9 +148,26 @@ def test_hits_iteration_limit_without_natural_stop_returns_low_confidence(retrie
     outcome = run_retrieval_subagent(llm, retriever, "headphones", max_iterations=4)
 
     assert outcome.iterations_used == 4
-    assert outcome.confidence == "low"
+    assert outcome.confidence == "high"
     # Best-effort result is still returned, not discarded, even though the budget ran out.
     assert len(outcome.chunks) > 0
+
+
+def test_hitting_the_iteration_limit_with_nothing_found_is_still_low_confidence(
+    retriever: Retriever,
+):
+    llm = FakeChatModel(
+        responses=[
+            _tool_call_message("get_sku_details", {"sku_id": "SKU-GHOST"}, call_id=f"call-{i}")
+            for i in range(10)
+        ]
+    )
+
+    outcome = run_retrieval_subagent(llm, retriever, "ghost sku", max_iterations=4)
+
+    assert outcome.iterations_used == 4
+    assert outcome.chunks == []
+    assert outcome.confidence == "low"
 
 
 def test_no_chunks_found_is_low_confidence_even_without_hitting_the_limit(retriever: Retriever):
