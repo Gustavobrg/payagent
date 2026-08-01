@@ -14,6 +14,14 @@ Two responsibilities live here, both required by invariants in CLAUDE.md:
   chunk actually offered. The output rail `grounding_check` (bloco 8) reuses this function
   as-is rather than re-implementing citation parsing.
 
+Also scans every chunk for P4 injection (docs/guardrail-taxonomy.md) before it can enter the
+assembled context — `payagent.guardrails.heuristics.scan`, the same deterministic patterns
+the input rail's `heuristic_injection_check` uses. This has to happen here, not in
+`rag/ingest.py` or `rag/retriever.py`: the chunk must still come back from retrieval (so
+`state.retrieved_chunks` and the eval harness's `injection_block_rate` see it), only the
+*assembled* context silently omits it. A flagged chunk is dropped and the event is logged;
+the rest of the batch proceeds unaffected.
+
 Deduplication matters because the retrieval sub-agent (`graph.nodes.retrieve`) can reach
 the same SKU two different ways in one turn — `search_catalog` returning a fuzzy hit and
 `get_sku_details` returning the exact lookup — and both are legitimate tool calls. Without
@@ -27,6 +35,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from payagent.guardrails import heuristics
 from payagent.observability.logging import get_logger
 from payagent.rag.tools import ToolChunk
 
@@ -63,10 +72,35 @@ class AssembledContext:
     chunks: list[ToolChunk]
     dropped_duplicates: int
     dropped_budget: int
+    dropped_injections: int
 
 
 def _estimate_tokens(text: str) -> int:
     return max(1, math.ceil(len(text) / _CHARS_PER_TOKEN))
+
+
+def _filter_injected(chunks: Sequence[ToolChunk]) -> tuple[list[ToolChunk], int]:
+    """Drop chunks flagged by the P4 heuristic scan; audit-log each one dropped.
+
+    The chunk itself was already retrieved (invariant: the eval harness still needs to see
+    it in `state.retrieved_chunks`) — this only decides whether it reaches the assembled
+    context text a later node prompts against.
+    """
+    safe: list[ToolChunk] = []
+    dropped = 0
+    for chunk in chunks:
+        result = heuristics.scan(chunk.text)
+        if result.blocked:
+            dropped += 1
+            logger.warning(
+                "p4_injection_chunk_discarded",
+                chunk_id=chunk.chunk_id,
+                source=chunk.source,
+                patterns=result.patterns,
+            )
+            continue
+        safe.append(chunk)
+    return safe, dropped
 
 
 def _dedupe(chunks: Sequence[ToolChunk]) -> tuple[list[ToolChunk], int]:
@@ -105,12 +139,14 @@ def assemble_context(
 ) -> AssembledContext:
     """Dedupe, rank, and budget-cut `chunks` into the context block for the next node.
 
-    Order: dedupe by chunk_id first, then sort by score descending, then greedily include
+    Order: scan for P4 injection first (dropped chunks never occupy dedup/rank/budget
+    slots), then dedupe by chunk_id, then sort by score descending, then greedily include
     chunks (highest-ranked first) until the next one would exceed `max_tokens`. The cutoff
     is a hard stop, not best-effort bin-packing — once a chunk doesn't fit, assembly ends,
     so token usage stays monotonic with rank.
     """
-    deduped, dropped_duplicates = _dedupe(chunks)
+    safe, dropped_injections = _filter_injected(chunks)
+    deduped, dropped_duplicates = _dedupe(safe)
     ordered = sorted(deduped, key=_sort_key, reverse=True)
 
     included: list[ToolChunk] = []
@@ -127,6 +163,7 @@ def assemble_context(
     logger.info(
         "context_assembled",
         input_chunks=len(chunks),
+        dropped_injections=dropped_injections,
         dropped_duplicates=dropped_duplicates,
         included=len(included),
         dropped_budget=dropped_budget,
@@ -139,6 +176,7 @@ def assemble_context(
         chunks=included,
         dropped_duplicates=dropped_duplicates,
         dropped_budget=dropped_budget,
+        dropped_injections=dropped_injections,
     )
 
 

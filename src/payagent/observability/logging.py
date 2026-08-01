@@ -2,8 +2,8 @@
 
 Nenhum código de negócio deve usar `logging`/`print` diretamente: importe `get_logger`
 daqui. Todo event_dict passa por `dlp.mask_value` antes do sink (invariante I2 do
-CLAUDE.md) — hoje `dlp.mask` é um passthrough (stub), mas o wrapper já está no lugar
-certo para quando o Bloco 7 implementar a redação de verdade.
+CLAUDE.md) — ver `guardrails/dlp.py` para a detecção real (regex + Luhn para PAN/CVV,
+Presidio para PII).
 """
 
 from __future__ import annotations

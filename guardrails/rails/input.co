@@ -1,0 +1,44 @@
+# Colang 1.0 — INPUT RAILS
+#
+# Regra de ouro: nada aqui decide sobre dinheiro. Estes fluxos apenas classificam e
+# bloqueiam conteúdo. Limite, allowlist, escopo de mandato e step-up vivem em
+# src/payagent/policy/ (INVARIANTE I1).
+
+define bot refuse card data
+  "Não trabalho com número de cartão, CVV ou validade em conversa. Os dados de
+   pagamento ficam no cofre e são referenciados por token."
+
+define bot refuse policy violation
+  "Não posso seguir com esse pedido. Ele foi bloqueado pela política de segurança
+   de transações."
+
+define bot refuse injection
+  "Detectei uma instrução que tenta alterar meu comportamento de pagamento.
+   Vou ignorá-la e continuar com o pedido original."
+
+
+# --- P1: dados de cartão. Determinístico, roda antes de qualquer modelo. -------
+define flow dlp scan input
+  $dlp = execute dlp_scan_input
+  if $dlp["has_card_data"]
+    bot refuse card data
+    stop
+
+
+# --- Padrões conhecidos de injeção. Barato, roda antes do classificador. -------
+define flow heuristic injection check
+  $heur = execute heuristic_injection_check
+  if $heur["blocked"]
+    bot refuse injection
+    stop
+
+
+# --- Llama Guard com a taxonomia customizada P1..P5. --------------------------
+define flow llama guard check input
+  $lg = execute llama_guard_check_input
+  $allowed = $lg["allowed"]
+  $violations = $lg["policy_violations"]
+
+  if not $allowed
+    bot refuse policy violation
+    stop

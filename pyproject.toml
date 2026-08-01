@@ -25,6 +25,7 @@ dependencies = [
     "pyyaml",
     "python-dotenv>=1.2.2",
     "gradio>=6.22.0",
+    "en-core-web-sm",
 ]
 
 [dependency-groups]
@@ -45,6 +46,9 @@ packages = ["src/payagent"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Makes `guardrails/actions.py` importable as `actions` — it's NeMo's config directory
+# (auto-imported by RailsConfig.from_path), not part of the src/payagent package.
+pythonpath = ["guardrails"]
 
 [tool.ruff]
 line-length = 100
@@ -56,3 +60,6 @@ ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["payagent"]
+
+[tool.uv.sources]
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }

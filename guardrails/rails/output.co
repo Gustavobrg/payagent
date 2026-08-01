@@ -1,0 +1,34 @@
+# Colang 1.0 — OUTPUT RAILS
+
+define bot refuse ungrounded
+  "Não consegui fundamentar essa resposta nas fontes do catálogo e das políticas.
+   Prefiro não afirmar nada sem citação."
+
+define bot refuse output violation
+  "A resposta gerada foi bloqueada pela política de segurança."
+
+
+# --- P1/I2: determinístico, roda PRIMEIRO — mesma regra do input rail. Também
+# evita mandar PAN/PII sem máscara para o classificador (llama guard) no passo
+# seguinte. Este fluxo NÃO bloqueia; ele reescreve $bot_message. Se precisar
+# agir, é bug em outra camada — por isso incrementa o contador de auditoria.
+define flow dlp mask output
+  $m = execute dlp_mask_output
+  $bot_message = $m["text"]
+  if $m["redacted"]
+    execute audit_log_redaction
+
+
+# --- I4: nenhuma afirmação factual sem citação de chunk recuperado. -----------
+define flow grounding check
+  $g = execute grounding_check
+  if not $g["grounded"]
+    bot refuse ungrounded
+    stop
+
+
+define flow llama guard check output
+  $lg = execute llama_guard_check_output
+  if not $lg["allowed"]
+    bot refuse output violation
+    stop

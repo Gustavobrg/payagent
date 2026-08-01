@@ -1,0 +1,55 @@
+# NeMo Guardrails — modo RAILS-ONLY.
+# Dialog rails ficam vazios de propósito: quem conduz a conversa é o LangGraph.
+# O NeMo atua em exatamente dois pontos: entrada do usuário e saída do agente
+# (payagent.guardrails.rails.check_input/check_output, sempre com dialog=False —
+# geração via LLM nunca é acionada por este config; ver invocação em rails.py).
+#
+# ⚠️ Confirme a versão instalada de nemoguardrails antes de editar os .co —
+#    a sintaxe Colang 1.0 e 2.x é incompatível. colang_version fixa isso explicitamente.
+colang_version: "1.0"
+
+# Sem 'main': em modo rails-only, sem dialog flows, nada aqui jamais faz uma chamada de
+# geração — um 'main' presente só serve para quebrar a construção do LLMRails se as
+# credenciais não estiverem completas (Azure exige azure_deployment; não configuramos).
+models:
+  # Documenta o backend do classificador. guardrails/actions.py's llama_guard_check_input/
+  # check_output chamam payagent.guardrails.provider.OpenRouterLlamaGuard diretamente
+  # (não o registro de models do NeMo) — é essa chamada que materializa "engine
+  # OpenRouter", não esta entrada. Mantida em sincronia por documentação (CLAUDE.md:
+  # "Llama Guard via Ollama em dev... interface GuardrailProvider permite trocar por
+  # endpoint Azure AI Foundry" — dev agora aponta para OpenRouter, não mais Ollama local).
+  - type: llama_guard
+    engine: openai
+    model: meta-llama/llama-guard-4-12b
+    parameters:
+      base_url: https://openrouter.ai/api/v1
+      api_key: ${OPENROUTER_API_KEY}
+
+rails:
+  input:
+    flows:
+      - dlp scan input            # determinístico, roda PRIMEIRO
+      - heuristic injection check # padrões conhecidos, barato
+      - llama guard check input   # classificador, taxonomia P1..P5
+
+  output:
+    flows:
+      - dlp mask output           # determinístico, roda PRIMEIRO (mesma regra do input
+                                   # rail) — também evita mandar PAN/PII sem máscara para
+                                   # o classificador externo no passo seguinte
+      - grounding check           # I4: resposta sem citação é rejeitada
+      - llama guard check output
+
+  dialog:
+    single_call:
+      enabled: false
+
+# Sem 'instructions' de persona e sem sample_conversation extensa:
+# não queremos que o NeMo tente gerar diálogo. Ele só filtra.
+instructions:
+  - type: general
+    content: |
+      Componente de filtragem de segurança do PayAgent Guard.
+      Não conduz conversa e não decide sobre transações.
+
+streaming: false
