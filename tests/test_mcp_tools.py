@@ -23,11 +23,14 @@ from doubles import (
     counter_id_factory,
 )
 from mcp.shared.exceptions import MCPError
+from pydantic import ValidationError
 
 from payagent.mcp_server.dispatch import REPLAY_META_KEY, dispatch_tool_call
 from payagent.mcp_server.merchant_sim import MerchantBehavior, MerchantSim
 from payagent.mcp_server.registry import TOOL_SPECS
-from payagent.policy import DenyAllPolicyEngine
+from payagent.mcp_server.schemas import ExecuteSettlementRequest
+from payagent.mcp_server.step_up import InMemoryStepUpVerifier
+from payagent.policy import DenyAllPolicyEngine, RulesPolicyEngine
 
 SIDE_EFFECT_TOOLS = [
     "create_intent_mandate",
@@ -825,3 +828,89 @@ async def test_every_result_mirrors_its_envelope_into_text_content(deps):
     result = await dispatch_tool_call(deps, "search_catalog", VALID_ARGUMENTS["search_catalog"])
 
     assert json.loads(result.content[0].text) == result.structured_content
+
+
+# ============================================================ P5: step-up cannot come from a tool call
+
+
+def test_execute_settlement_schema_has_no_field_that_can_assert_step_up():
+    """P5 structurally: `extra='forbid'` means a caller cannot smuggle step-up state into the call."""
+    with pytest.raises(ValidationError):
+        ExecuteSettlementRequest(
+            idempotency_key=KEY_SETTLE,
+            payment_mandate_id="PM-0000000000000002",
+            expected_amount_cents=4999,
+            expected_currency="BRL",
+            step_up_satisfied=True,  # type: ignore[call-arg]
+        )
+
+
+async def test_settlement_above_the_stepup_threshold_is_denied_without_out_of_band_resolution(
+    build_deps,
+):
+    """POL-003 through the real engine: no request field can stand in for the WebAuthn ceremony."""
+    engine = RulesPolicyEngine(
+        max_amount_cents=1_000_000,
+        stepup_threshold_cents=1000,
+        daily_aggregate_limit_cents=1_000_000,
+        merchant_allowlist=frozenset({"MERCH-01", "MERCH-02"}),
+        restricted_categories=frozenset(),
+    )
+    deps = build_deps(
+        policy=engine,
+        mandate_authority=AlwaysVerifyingAuthority(),
+        step_up=InMemoryStepUpVerifier(id_factory=counter_id_factory()),
+    )
+    intent = await _intent(deps, max_amount_cents=1_000_000)
+    quote = await _quote(deps)
+    payment = await dispatch_tool_call(
+        deps,
+        "create_payment_mandate",
+        {
+            "idempotency_key": KEY_PAYMENT,
+            "intent_mandate_id": intent["intent_mandate_id"],
+            "quote_id": quote["quote_id"],
+            "expected_amount_cents": quote["amount_cents"],
+            "expected_currency": quote["currency"],
+        },
+    )
+
+    assert _error(payment)["denial"]["code"] == "STEP_UP_REQUIRED"
+    assert deps.mandate_store.payment_count == 0
+
+
+async def test_settlement_above_the_stepup_threshold_succeeds_after_the_separate_channel_resolves_it(
+    build_deps, clock
+):
+    """Same scenario, but the step-up ceremony completes out of band before the retry."""
+    step_up = InMemoryStepUpVerifier(id_factory=counter_id_factory())
+    engine = RulesPolicyEngine(
+        max_amount_cents=1_000_000,
+        stepup_threshold_cents=1000,
+        daily_aggregate_limit_cents=1_000_000,
+        merchant_allowlist=frozenset({"MERCH-01", "MERCH-02"}),
+        restricted_categories=frozenset(),
+    )
+    deps = build_deps(
+        policy=engine, mandate_authority=AlwaysVerifyingAuthority(), step_up=step_up
+    )
+    intent = await _intent(deps, max_amount_cents=1_000_000)
+    quote = await _quote(deps)
+
+    # The step-up ceremony happens on a channel entirely separate from the tool call.
+    challenge = step_up.issue_challenge(now=clock())
+    step_up.resolve_challenge(challenge.challenge_id, now=clock())
+
+    payment = await dispatch_tool_call(
+        deps,
+        "create_payment_mandate",
+        {
+            "idempotency_key": "idem-key-payment-00002",
+            "intent_mandate_id": intent["intent_mandate_id"],
+            "quote_id": quote["quote_id"],
+            "expected_amount_cents": quote["amount_cents"],
+            "expected_currency": quote["currency"],
+        },
+    )
+
+    assert _data(payment)["status"] == "issued"

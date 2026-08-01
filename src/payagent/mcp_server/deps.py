@@ -20,6 +20,7 @@ from payagent.mandates import MandateAuthority, MandateStore
 from payagent.mcp_server.idempotency import IdempotencyStore
 from payagent.mcp_server.merchant_sim import MerchantSim
 from payagent.mcp_server.quotes import DEFAULT_QUOTE_TTL_SECONDS, QuoteStore
+from payagent.mcp_server.step_up import StepUpVerifier
 from payagent.policy import PolicyEngine
 from payagent.rag.retriever import Retriever
 
@@ -40,6 +41,8 @@ class ToolDeps:
         clock: Returns "now". Injected so expiry is deterministic.
         id_factory: `prefix -> id`. Production passes a uuid4-based factory: mandate and
             settlement IDs are capability-like handles, and sequential IDs are enumerable.
+        step_up: Server-side WebAuthn challenge/response state (POL-003). The only source of
+            `PolicyContext.step_up_satisfied` — never a tool argument (P5).
         quote_ttl_seconds: Quote validity window. Defaults to POL-010's 30 minutes.
     """
 
@@ -52,4 +55,5 @@ class ToolDeps:
     idempotency: IdempotencyStore
     clock: Callable[[], datetime]
     id_factory: Callable[[str], str]
+    step_up: StepUpVerifier
     quote_ttl_seconds: int = DEFAULT_QUOTE_TTL_SECONDS

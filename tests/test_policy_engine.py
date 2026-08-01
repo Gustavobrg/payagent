@@ -28,6 +28,7 @@ from payagent.policy import (
     PolicyContext,
     PolicyDenial,
     PolicyEngine,
+    RulesPolicyEngine,
     evaluate,
 )
 
@@ -197,3 +198,200 @@ def test_policy_package_imports_no_llm_network_or_caller(module_path: Path):
         assert root not in FORBIDDEN_IMPORT_ROOTS, f"{module_path.name} imports {name}"
         for forbidden in FORBIDDEN_FIRST_PARTY:
             assert not name.startswith(forbidden), f"{module_path.name} imports {name}"
+
+
+# ============================================================ RulesPolicyEngine (the real rules)
+
+# Deliberately far apart from the default max so amount-limit and step-up can be tested in
+# isolation from one another, mirroring POL-002 §6: the step-up threshold only ever matters
+# above the standard ceiling, which in production means it never fires. A high max here lets a
+# test push the amount past the step-up threshold without also tripping AMOUNT_EXCEEDS_LIMIT.
+_MAX_AMOUNT = 50_000
+_STEPUP_THRESHOLD = 100_000
+_DAILY_CAP = 200_000
+_ALLOWED_MERCHANTS = frozenset({"MERCH-01", "MERCH-02"})
+_RESTRICTED_CATEGORIES = frozenset({"alcoholic beverages", "jewelry and luxury watches"})
+
+
+def _rules_engine(**overrides) -> RulesPolicyEngine:
+    defaults = dict(
+        max_amount_cents=_MAX_AMOUNT,
+        stepup_threshold_cents=_STEPUP_THRESHOLD,
+        daily_aggregate_limit_cents=_DAILY_CAP,
+        merchant_allowlist=_ALLOWED_MERCHANTS,
+        restricted_categories=_RESTRICTED_CATEGORIES,
+    )
+    return RulesPolicyEngine(**{**defaults, **overrides})
+
+
+def test_rules_engine_allows_a_well_formed_purchase_within_every_limit():
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(amount_cents=4999, merchant_id="MERCH-02", category="electronics"),
+    )
+
+    assert isinstance(decision, Allow)
+    assert decision.grant.amount_cents == 4999
+
+
+def test_rules_engine_denies_amount_above_the_per_transaction_limit():
+    """POL-001: any amount over POLICY_MAX_AMOUNT_CENTS is refused."""
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(amount_cents=_MAX_AMOUNT + 1, merchant_id="MERCH-02", category="electronics"),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.AMOUNT_EXCEEDS_LIMIT
+    assert decision.denial.policy_ref == "POL-001"
+
+
+def test_rules_engine_allows_amount_exactly_at_the_limit():
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(amount_cents=_MAX_AMOUNT, merchant_id="MERCH-02", category="electronics"),
+    )
+
+    assert isinstance(decision, Allow)
+
+
+def test_rules_engine_denies_merchant_outside_the_allowlist():
+    """POL-005: settlement is refused for any merchant_id not on the allowlist."""
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(amount_cents=1000, merchant_id="MERCH-99", category="electronics"),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.MERCHANT_NOT_ALLOWED
+    assert decision.denial.policy_ref == "POL-005"
+
+
+def test_rules_engine_denies_a_restricted_category_regardless_of_the_amount():
+    """POL-004: category restriction is not a limit, it applies at any amount."""
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(amount_cents=1, merchant_id="MERCH-02", category="alcoholic beverages"),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.CATEGORY_RESTRICTED
+    assert decision.denial.policy_ref == "POL-004"
+
+
+def test_rules_engine_denies_an_intent_mandate_scoped_to_a_restricted_category():
+    """The restriction also blocks the intent from ever declaring the scope, not just spending it."""
+    decision = _rules_engine().decide(
+        PolicyAction.CREATE_INTENT_MANDATE,
+        _context(
+            amount_cents=1000,
+            intent_mandate_allowed_categories=("electronics", "jewelry and luxury watches"),
+        ),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.CATEGORY_RESTRICTED
+
+
+def test_rules_engine_denies_an_intent_mandate_scoped_to_a_disallowed_merchant():
+    decision = _rules_engine().decide(
+        PolicyAction.CREATE_INTENT_MANDATE,
+        _context(
+            amount_cents=1000,
+            intent_mandate_allowed_categories=("electronics",),
+            intent_mandate_allowed_merchant_ids=("MERCH-99",),
+        ),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.MERCHANT_NOT_ALLOWED
+
+
+def test_rules_engine_denies_when_the_24h_aggregate_would_be_exceeded():
+    """POL-002: the running 24h total plus this transaction must not exceed the daily cap."""
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(
+            amount_cents=1000,
+            merchant_id="MERCH-02",
+            category="electronics",
+            aggregate_spent_24h_cents=_DAILY_CAP,
+        ),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.AGGREGATE_LIMIT_EXCEEDED
+    assert decision.denial.policy_ref == "POL-002"
+
+
+def test_rules_engine_allows_when_the_24h_aggregate_stays_within_the_cap():
+    decision = _rules_engine().decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(
+            amount_cents=1000,
+            merchant_id="MERCH-02",
+            category="electronics",
+            aggregate_spent_24h_cents=_DAILY_CAP - 1000,
+        ),
+    )
+
+    assert isinstance(decision, Allow)
+
+
+def test_rules_engine_denies_settlement_above_the_stepup_threshold_without_step_up():
+    """POL-003: step-up is mandatory above the threshold and cannot be implied."""
+    decision = _rules_engine(max_amount_cents=1_000_000).decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(
+            amount_cents=_STEPUP_THRESHOLD + 1,
+            merchant_id="MERCH-02",
+            category="electronics",
+            step_up_satisfied=False,
+        ),
+    )
+
+    assert isinstance(decision, Deny)
+    assert decision.denial.code is DenialCode.STEP_UP_REQUIRED
+    assert decision.denial.policy_ref == "POL-003"
+
+
+def test_rules_engine_allows_settlement_above_the_stepup_threshold_when_satisfied():
+    decision = _rules_engine(max_amount_cents=1_000_000).decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(
+            amount_cents=_STEPUP_THRESHOLD + 1,
+            merchant_id="MERCH-02",
+            category="electronics",
+            step_up_satisfied=True,
+        ),
+    )
+
+    assert isinstance(decision, Allow)
+
+
+def test_rules_engine_does_not_require_step_up_to_declare_an_intent_mandate_ceiling():
+    """An intent authorizes future spend; it does not itself move money (mandates/models.py)."""
+    decision = _rules_engine(max_amount_cents=1_000_000).decide(
+        PolicyAction.CREATE_INTENT_MANDATE,
+        _context(
+            amount_cents=_STEPUP_THRESHOLD + 1,
+            intent_mandate_allowed_categories=("electronics",),
+            step_up_satisfied=False,
+        ),
+    )
+
+    assert isinstance(decision, Allow)
+
+
+def test_rules_engine_does_not_require_step_up_at_or_below_the_threshold():
+    decision = _rules_engine(max_amount_cents=1_000_000).decide(
+        PolicyAction.EXECUTE_SETTLEMENT,
+        _context(
+            amount_cents=_STEPUP_THRESHOLD,
+            merchant_id="MERCH-02",
+            category="electronics",
+            step_up_satisfied=False,
+        ),
+    )
+
+    assert isinstance(decision, Allow)

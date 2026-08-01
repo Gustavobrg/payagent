@@ -17,14 +17,19 @@ which converts a raising, malformed, or mismatched decision into a denial. The e
 the resulting `EffectGrant` as a required positional argument, so an effect is unreachable from a
 code path that never obtained an `Allow`.
 
-`PolicyContext.step_up_satisfied` is hard-coded `False`. It must only ever be populated from
-server-side session state — a request field asserting "step-up already done" is exactly the P5
-evasion the step-up requirement exists to stop, which is why no request model has one.
+`PolicyContext.step_up_satisfied` comes from `deps.step_up.is_satisfied(now=now)` — server-side
+session state (`mcp_server/step_up.py`) — and nowhere else. No request model has a field for it;
+asserting "step-up already done" from a tool argument is exactly the P5 evasion the requirement
+exists to stop.
+
+`PolicyContext.aggregate_spent_24h_cents` (POL-002) is likewise computed here, from
+`deps.merchant.charges` — the settlement record, not a caller assertion — and passed to a `policy/`
+that does no I/O of its own.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from payagent.mandates import IntentMandate, PaymentMandate, summarize
 from payagent.mcp_server.catalog import lookup_sku, search_catalog_records
@@ -96,6 +101,21 @@ def _authorize(
     if isinstance(decision, Allow):
         return decision.grant
     raise _fail(ToolErrorCode.POLICY_DENIED, denial=decision.denial)
+
+
+def _aggregate_spent_24h_cents(deps: ToolDeps, *, now: datetime, currency: str) -> int:
+    """POL-002: sum of successful settlements in the trailing 24h, same currency.
+
+    Reads `deps.merchant.charges` — the settlement record — rather than any caller-supplied
+    running total, for the same reason `amount_cents` always comes from `get_quote`: an
+    aggregate a caller could assert would be P2 with a different name.
+    """
+    cutoff = now - timedelta(hours=24)
+    return sum(
+        charge.amount_cents
+        for charge in deps.merchant.charges.values()
+        if charge.currency == currency and charge.created_at >= cutoff
+    )
 
 
 def _translate_merchant_error(exc: Exception) -> HandlerFailure:
@@ -218,8 +238,8 @@ def handle_create_intent_mandate(
                 if request.allowed_merchant_ids is not None
                 else None
             ),
-            # Populated from server-side session state only, never from a request field (P5).
-            step_up_satisfied=False,
+            # Server-side session state only, never from a request field (P5).
+            step_up_satisfied=deps.step_up.is_satisfied(now=now),
         ),
     )
 
@@ -305,7 +325,10 @@ def handle_create_payment_mandate(
             intent_mandate_allowed_merchant_ids=intent.allowed_merchant_ids,
             quote_id=quote.quote_id,
             quote_expires_at=quote.expires_at,
-            step_up_satisfied=False,
+            aggregate_spent_24h_cents=_aggregate_spent_24h_cents(
+                deps, now=now, currency=quote.currency
+            ),
+            step_up_satisfied=deps.step_up.is_satisfied(now=now),
         ),
     )
 
@@ -338,6 +361,7 @@ def _issue_payment_mandate(
         amount_cents=quote.amount_cents,
         currency=quote.currency,
         merchant_id=quote.merchant_id,
+        category=quote.category,
         sku=quote.sku,
         quantity=quote.quantity,
         issued_at=quote.issued_at,
@@ -419,7 +443,10 @@ def handle_execute_settlement(
             payment_mandate_id=mandate.payment_mandate_id,
             quote_id=quote.quote_id,
             quote_expires_at=quote.expires_at,
-            step_up_satisfied=False,
+            aggregate_spent_24h_cents=_aggregate_spent_24h_cents(
+                deps, now=now, currency=quote.currency
+            ),
+            step_up_satisfied=deps.step_up.is_satisfied(now=now),
         ),
     )
 
@@ -474,7 +501,7 @@ def handle_refund(deps: ToolDeps, request: RefundRequest) -> RefundResult:
             settlement_id=charge.charge_id,
             settled_amount_cents=charge.amount_cents,
             refund_reason_code=request.reason_code,
-            step_up_satisfied=False,
+            step_up_satisfied=deps.step_up.is_satisfied(now=now),
         ),
     )
 

@@ -115,9 +115,16 @@ class PolicyContext:
 
     step_up_satisfied: bool = False
 
+    # POL-002: the sum of successful transactions in the trailing 24h, computed by the caller
+    # from the settlement record (`mcp_server/handlers.py`, from `MerchantSim.charges`) — never
+    # by this package, which does no I/O. Defaults to 0 for actions that do not spend (e.g. a
+    # refund), so the aggregate check never fires for them.
+    aggregate_spent_24h_cents: int = 0
+
     def __post_init__(self) -> None:
         _require_int_cents(self.amount_cents, "amount_cents")
         _require_aware(self.now, "now")
+        _require_int_cents(self.aggregate_spent_24h_cents, "aggregate_spent_24h_cents")
         if self.intent_mandate_max_amount_cents is not None:
             _require_int_cents(
                 self.intent_mandate_max_amount_cents, "intent_mandate_max_amount_cents"

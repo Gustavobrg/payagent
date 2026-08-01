@@ -26,6 +26,7 @@ from payagent.mcp_server.deps import ToolDeps
 from payagent.mcp_server.idempotency import InMemoryIdempotencyStore
 from payagent.mcp_server.merchant_sim import MerchantSim
 from payagent.mcp_server.quotes import InMemoryQuoteStore
+from payagent.mcp_server.step_up import InMemoryStepUpVerifier
 from payagent.policy import DenyAllPolicyEngine
 from payagent.rag.ingest import (
     CATALOG_COLLECTION,
@@ -109,6 +110,7 @@ def build_deps(retriever: Retriever, clock: FakeClock, merchant: MerchantSim):
             "idempotency": InMemoryIdempotencyStore(),
             "clock": clock,
             "id_factory": counter_id_factory(),
+            "step_up": InMemoryStepUpVerifier(id_factory=counter_id_factory()),
         }
         return ToolDeps(**{**defaults, **overrides})
 

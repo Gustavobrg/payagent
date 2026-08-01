@@ -8,7 +8,7 @@ Callers use `evaluate(engine, action, context)`, never `engine.decide(...)`: `ev
 fail-closed funnel that turns a raising, malformed, or mismatched decision into a denial.
 """
 
-from payagent.policy.engine import DenyAllPolicyEngine, PolicyEngine, evaluate
+from payagent.policy.engine import DenyAllPolicyEngine, PolicyEngine, RulesPolicyEngine, evaluate
 from payagent.policy.models import (
     Allow,
     DenialCode,
@@ -31,5 +31,6 @@ __all__ = [
     "PolicyDecision",
     "PolicyDenial",
     "PolicyEngine",
+    "RulesPolicyEngine",
     "evaluate",
 ]

@@ -81,6 +81,7 @@ class PaymentMandate:
     amount_cents: int
     currency: str
     merchant_id: str
+    category: str
     sku: str
     quantity: int
     issued_at: datetime

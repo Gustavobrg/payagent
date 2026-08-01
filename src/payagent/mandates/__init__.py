@@ -10,26 +10,37 @@ no code path in `src/` can settle (invariant I3, upheld by refusal).
 """
 
 from payagent.mandates.authority import (
+    Ed25519MandateAuthority,
     MandateAuthority,
     MandateVerification,
     UnsignedMandateAuthority,
 )
+from payagent.mandates.did_key import did_key_from_ed25519_public_key
 from payagent.mandates.models import (
     IntentMandate,
     MandateSummary,
     PaymentMandate,
     summarize,
 )
-from payagent.mandates.store import InMemoryMandateStore, MandateStore
+from payagent.mandates.store import (
+    InMemoryMandateSignatureStore,
+    InMemoryMandateStore,
+    MandateSignatureStore,
+    MandateStore,
+)
 
 __all__ = [
+    "Ed25519MandateAuthority",
+    "InMemoryMandateSignatureStore",
     "InMemoryMandateStore",
     "IntentMandate",
     "MandateAuthority",
+    "MandateSignatureStore",
     "MandateStore",
     "MandateSummary",
     "MandateVerification",
     "PaymentMandate",
     "UnsignedMandateAuthority",
+    "did_key_from_ed25519_public_key",
     "summarize",
 ]

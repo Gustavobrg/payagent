@@ -14,14 +14,18 @@ from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from payagent.mandates import (
+    Ed25519MandateAuthority,
+    InMemoryMandateSignatureStore,
     InMemoryMandateStore,
     IntentMandate,
     MandateSummary,
     MandateVerification,
     PaymentMandate,
     UnsignedMandateAuthority,
+    did_key_from_ed25519_public_key,
     summarize,
 )
 
@@ -53,6 +57,7 @@ def _payment(**overrides) -> PaymentMandate:
         "amount_cents": 4999,
         "currency": "BRL",
         "merchant_id": "MERCH-02",
+        "category": "electronics",
         "sku": "SKU-SPEAKER",
         "quantity": 1,
         "issued_at": FIXED_NOW,
@@ -158,3 +163,175 @@ def test_store_returns_none_for_an_unknown_id_rather_than_raising():
 
     assert store.get_intent("IM-doesnotexist") is None
     assert store.get_payment("PM-doesnotexist") is None
+
+
+# ======================================================= Ed25519MandateAuthority (real signing)
+
+
+def _authority(
+    *, private_key: Ed25519PrivateKey | None = None, signatures: InMemoryMandateSignatureStore | None = None
+) -> tuple[Ed25519MandateAuthority, InMemoryMandateSignatureStore]:
+    signatures = signatures if signatures is not None else InMemoryMandateSignatureStore()
+    authority = Ed25519MandateAuthority(
+        private_key=private_key or Ed25519PrivateKey.generate(),
+        signatures=signatures,
+    )
+    return authority, signatures
+
+
+def _issue_chain(authority: Ed25519MandateAuthority, **payment_overrides) -> PaymentMandate:
+    """Issue a matching intent + payment pair through `authority`, scope compatible by default."""
+    intent = authority.issue_intent(_intent())
+    payment = authority.issue_payment(_payment(intent_mandate_id=intent.intent_mandate_id, **payment_overrides))
+    return payment
+
+
+def test_did_key_from_ed25519_public_key_is_a_self_certifying_identifier():
+    """did:key has no registry: the identifier is derived from the key, not looked up."""
+    key_a = Ed25519PrivateKey.generate()
+    key_b = Ed25519PrivateKey.generate()
+
+    did_a = did_key_from_ed25519_public_key(key_a.public_key())
+    did_a_again = did_key_from_ed25519_public_key(key_a.public_key())
+    did_b = did_key_from_ed25519_public_key(key_b.public_key())
+
+    assert did_a.startswith("did:key:z")
+    assert did_a == did_a_again
+    assert did_a != did_b
+
+
+def test_ed25519_authority_exposes_its_did_key_identifier():
+    authority, _ = _authority()
+
+    assert authority.did.startswith("did:key:z")
+
+
+def test_ed25519_authority_verifies_a_well_formed_signed_chain():
+    authority, _ = _authority()
+
+    payment = _issue_chain(authority)
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification == MandateVerification(verified=True)
+
+
+def test_ed25519_authority_denies_a_tampered_signature():
+    """The JWS payload was altered after signing — the signature no longer matches."""
+    authority, signatures = _authority()
+    payment = _issue_chain(authority)
+
+    original = signatures.get(payment.payment_mandate_id)
+    header, payload, signature = original.split(".")
+    tampered = f"{header}.{payload}A.{signature}"
+    signatures.put(payment.payment_mandate_id, tampered)
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_SIGNATURE_INVALID"
+
+
+def test_ed25519_authority_denies_a_mandate_with_no_stored_signature():
+    authority, _ = _authority()
+    payment = _payment()  # never issued through the authority
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_SIGNATURE_MISSING"
+
+
+def test_ed25519_authority_denies_an_expired_payment_mandate():
+    authority, _ = _authority()
+    payment = _issue_chain(authority)
+
+    verification = authority.verify_for_settlement(
+        payment, now=payment.expires_at + timedelta(seconds=1)
+    )
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_EXPIRED"
+
+
+def test_ed25519_authority_denies_a_payment_mandate_whose_parent_intent_was_never_issued():
+    """POL-009 §3: an intent id with nothing signed behind it is not a valid parent reference."""
+    authority, _ = _authority()
+    payment = authority.issue_payment(_payment(intent_mandate_id="IM-doesnotexist"))
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_CHAIN_BROKEN"
+
+
+def test_ed25519_authority_denies_a_parent_intent_signed_by_a_foreign_key():
+    """The chain-broken case for 'another user': the parent record was signed by a different key.
+
+    Shares one signature store between two authorities with different keys, simulating a
+    payment mandate whose declared parent is a record this authority never vouched for —
+    forged, or belonging to a different tenant's signing key.
+    """
+    shared_signatures = InMemoryMandateSignatureStore()
+    foreign_authority, _ = _authority(signatures=shared_signatures)
+    trusted_authority, _ = _authority(signatures=shared_signatures)
+
+    foreign_intent = foreign_authority.issue_intent(_intent())
+    payment = trusted_authority.issue_payment(
+        _payment(intent_mandate_id=foreign_intent.intent_mandate_id)
+    )
+
+    verification = trusted_authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_CHAIN_BROKEN"
+
+
+def test_ed25519_authority_denies_a_payment_mandate_exceeding_the_intents_amount_ceiling():
+    authority, _ = _authority()
+    intent = authority.issue_intent(_intent(max_amount_cents=1000))
+    payment = authority.issue_payment(
+        _payment(intent_mandate_id=intent.intent_mandate_id, amount_cents=1001)
+    )
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_SCOPE_EXCEEDED"
+
+
+def test_ed25519_authority_denies_a_payment_mandate_outside_the_intents_allowed_categories():
+    authority, _ = _authority()
+    intent = authority.issue_intent(_intent(allowed_categories=("books",)))
+    payment = authority.issue_payment(
+        _payment(intent_mandate_id=intent.intent_mandate_id, category="electronics")
+    )
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_SCOPE_EXCEEDED"
+
+
+def test_ed25519_authority_denies_a_payment_mandate_outside_the_intents_allowed_merchants():
+    authority, _ = _authority()
+    intent = authority.issue_intent(_intent(allowed_merchant_ids=("MERCH-01",)))
+    payment = authority.issue_payment(
+        _payment(intent_mandate_id=intent.intent_mandate_id, merchant_id="MERCH-02")
+    )
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is False
+    assert verification.code == "MANDATE_SCOPE_EXCEEDED"
+
+
+def test_ed25519_authority_allows_any_merchant_when_the_intent_does_not_narrow_it():
+    authority, _ = _authority()
+    intent = authority.issue_intent(_intent(allowed_merchant_ids=None))
+    payment = authority.issue_payment(
+        _payment(intent_mandate_id=intent.intent_mandate_id, merchant_id="MERCH-07")
+    )
+
+    verification = authority.verify_for_settlement(payment, now=FIXED_NOW)
+
+    assert verification.verified is True
