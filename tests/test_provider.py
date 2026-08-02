@@ -72,6 +72,45 @@ def test_fixture_provider_raises_on_an_unrecorded_message():
         provider.check_input("some message that was never recorded in the fixture")
 
 
+# --- pass-through mode — the eval harness's --no-guardrails ablation. --------------
+
+
+def test_fixture_provider_pass_through_does_not_require_a_fixture_file():
+    """No fixture file needed at all in pass-through mode — it never consults one."""
+    provider = FixtureGuardrailProvider(pass_through=True, fixture_path="/nonexistent/path.json")
+
+    verdict = provider.check_input("anything at all, never recorded anywhere")
+
+    assert isinstance(verdict, GuardrailVerdict)
+    assert verdict.allowed is True
+    assert verdict.categories == ()
+
+
+def test_fixture_provider_pass_through_allows_any_input_regardless_of_content():
+    provider = FixtureGuardrailProvider(pass_through=True)
+
+    verdict = provider.check_input("Meu cartao e 4111 1111 1111 1111")
+
+    assert verdict.allowed is True
+
+
+def test_fixture_provider_pass_through_allows_any_output():
+    provider = FixtureGuardrailProvider(pass_through=True)
+
+    verdict = provider.check_output("qualquer resposta do agente")
+
+    assert verdict.allowed is True
+
+
+def test_fixture_provider_without_pass_through_still_requires_a_fixture():
+    """Default behavior (pass_through=False) is unchanged: still needs recorded fixtures."""
+    provider = FixtureGuardrailProvider()
+
+    verdict = provider.check_input(SAFE_MESSAGE)
+
+    assert verdict.allowed is True
+
+
 # --- OpenRouterLlamaGuard — reuses the parser calibrated in scripts/probe_llama_guard.py.
 
 

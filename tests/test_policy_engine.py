@@ -395,3 +395,26 @@ def test_rules_engine_does_not_require_step_up_at_or_below_the_threshold():
     )
 
     assert isinstance(decision, Allow)
+
+
+def _read_env_example_int(name: str) -> int:
+    env_example = Path(__file__).resolve().parent.parent / ".env.example"
+    for line in env_example.read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"{name}="):
+            return int(line.split("=", 1)[1].strip())
+    raise AssertionError(f"{name} not found in .env.example")
+
+
+def test_env_example_keeps_step_up_reachable():
+    """Regression guard for scenarios.yaml achado #1: `decide()` checks the amount ceiling
+    (POL-001) before the step-up threshold (POL-003), so any documented default where
+    `POLICY_STEPUP_THRESHOLD_CENTS >= POLICY_MAX_AMOUNT_CENTS` makes POL-003 dead code —
+    every amount large enough to require step-up is already denied by AMOUNT_EXCEEDS_LIMIT
+    first. This does not exercise `RulesPolicyEngine` itself (that's already covered above);
+    it only pins the *documented default config* so this specific misconfiguration can't
+    silently come back.
+    """
+    max_amount = _read_env_example_int("POLICY_MAX_AMOUNT_CENTS")
+    stepup_threshold = _read_env_example_int("POLICY_STEPUP_THRESHOLD_CENTS")
+
+    assert stepup_threshold < max_amount

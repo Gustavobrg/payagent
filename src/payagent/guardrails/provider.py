@@ -1,7 +1,12 @@
 """GuardrailProvider seam — swap the Llama Guard endpoint without touching graph or rail code.
 
-`Architecture.md`: "Llama Guard via Ollama em dev (interface `GuardrailProvider` permite
-trocar por endpoint Azure AI Foundry)" — this module is that interface.
+STALE-DOCS NOTE (2026-08-01): `Architecture.md` still says "Llama Guard via Ollama em dev" —
+that stopped being true at some point before this date. `guardrails/config.yml`'s own comment
+already documents the actual current state ("dev agora aponta para OpenRouter, não mais
+Ollama local"); this module docstring is now corrected to match. `GuardrailProvider` is still
+the swappable interface `Architecture.md` describes, but no Ollama-backed implementation
+exists anywhere in this codebase today — only `OpenRouterLlamaGuard` and the test-only
+`FixtureGuardrailProvider` below.
 
 The taxonomy blocks and `parse_llama_guard_response` below are the ones calibrated by
 `scripts/probe_llama_guard.py` against the real model (see that script's module docstring
@@ -10,10 +15,12 @@ truth, and the probe script imports them back rather than keeping its own copy.
 
 Two implementations:
 
-- `OpenRouterLlamaGuard` calls meta-llama/llama-guard-4-12b through OpenRouter — used by the
-  probe script to validate the taxonomy end to end. It is **not** the provider wired into
-  the running NeMo rails; that's the `llama_guard` engine in `guardrails/config.yml`
-  (native Ollama, `llama-guard3:1b`), invoked through a separate NeMo action.
+- `OpenRouterLlamaGuard` calls meta-llama/llama-guard-4-12b through OpenRouter. This **is**
+  the provider `guardrails/actions.py`'s `llama_guard_check_input`/`_output` actually call
+  (directly, via `_get_provider()` — not through NeMo's own model registry; the `models:`
+  entry in `guardrails/config.yml` is documentation only, per that file's own comment) —
+  i.e. it *is* what's wired into the running NeMo rails, contrary to what this docstring
+  used to claim. It's also what the probe script uses to validate the taxonomy end to end.
 - `FixtureGuardrailProvider` replays the raw responses recorded in
   `scripts/fixtures/llama_guard_probe.json` for a fixed set of known messages. It is what
   the test suite uses — no network, no live model.
@@ -227,9 +234,22 @@ class FixtureGuardrailProvider(GuardrailProvider):
 
     Deliberately raises on a message that was never recorded, instead of failing open or
     closed silently — it means a test needs a new fixture entry, not a guess.
+
+    `pass_through=True` switches to a second mode that never reads a fixture file at all:
+    every `check_input`/`check_output` call is unconditionally "safe". This is what
+    `evals/harness/run.py --no-guardrails` wires in via
+    `payagent.guardrails.actions.set_guardrail_provider` for its ablation — it neutralizes
+    only this seam (the Llama Guard semantic classifier), leaving `dlp_scan_input`,
+    `heuristic_injection_check`, `grounding_check`, and `dlp_mask_output` running exactly as
+    before, since none of those go through a `GuardrailProvider` at all. That isolates how
+    much of the block rate the classifier contributes versus the deterministic rails alone.
     """
 
-    def __init__(self, fixture_path: Path = _FIXTURE_PATH) -> None:
+    def __init__(self, fixture_path: Path = _FIXTURE_PATH, *, pass_through: bool = False) -> None:
+        self._pass_through = pass_through
+        if pass_through:
+            self._by_message = {}
+            return
         entries = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
         missing_message = [e["id"] for e in entries if "message" not in e]
         if missing_message:
@@ -246,6 +266,8 @@ class FixtureGuardrailProvider(GuardrailProvider):
         return self._check(text)
 
     def _check(self, text: str) -> GuardrailVerdict:
+        if self._pass_through:
+            return GuardrailVerdict(allowed=True, categories=(), raw_response="safe (pass-through ablation mode)")
         try:
             raw = self._by_message[text]
         except KeyError:

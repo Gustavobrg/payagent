@@ -46,9 +46,10 @@ packages = ["src/payagent"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# Makes `guardrails/actions.py` importable as `actions` — it's NeMo's config directory
-# (auto-imported by RailsConfig.from_path), not part of the src/payagent package.
-pythonpath = ["guardrails"]
+# "guardrails" makes guardrails/actions.py importable as `actions` — it's NeMo's config
+# directory (auto-imported by RailsConfig.from_path), not part of the src/payagent package.
+# "." makes `evals.harness.*` importable the same way `python -m evals.harness.run` sees it.
+pythonpath = ["guardrails", "."]
 
 [tool.ruff]
 line-length = 100

@@ -8,6 +8,7 @@ vector search, optional payload filtering, and reranking.
 from __future__ import annotations
 
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -20,6 +21,19 @@ from payagent.rag.ingest import Embedder, build_embedder, connect_qdrant
 logger = get_logger(__name__)
 
 DEFAULT_RERANK_MODEL = "cohere/rerank-4-fast"
+
+# achado #5 (scenarios.yaml header): `search` used to always return up to `top_k` candidates
+# regardless of relevance, so a query for something genuinely absent from the catalog still
+# came back with `top_k` unrelated real products instead of signaling "nothing matches."
+# 0.0 is a deliberately conservative floor: it excludes only candidates the reranker measured
+# as having literally zero relevance (a `DeterministicReranker` keyword-overlap score of
+# exactly 0.0 for tests and the eval harness's `use_deterministic_embedder` path), never a
+# candidate with any positive signal. `OpenRouterReranker` (the live Cohere cross-encoder) is
+# expected to almost never return an exact 0.0 for a real query, so this floor is a safety
+# net for the unambiguous case, not a calibrated relevance cutoff — raising it for production
+# needs live-model calibration (same caveat as `guardrails/provider.py`'s Llama Guard note:
+# not done blind, would need a probe script run against the real reranker first).
+DEFAULT_MIN_RELEVANCE_SCORE = 0.0
 
 # Exact-match filter keys per collection: filter dict key -> Qdrant payload field name.
 _EXACT_MATCH_FIELDS = {
@@ -102,16 +116,25 @@ class OpenRouterReranker(Reranker):
 
 
 class DeterministicReranker(Reranker):
-    """Test reranker: keyword-overlap heuristic (no network calls)."""
+    """Test reranker: keyword-overlap heuristic (no network calls).
+
+    Tokenizes on `\\w+` rather than plain `.split()` so trailing punctuation ("Speaker."
+    vs. query word "speaker") doesn't produce a false-zero score — a real cross-encoder
+    isn't punctuation-sensitive either, and `Retriever.search`'s `min_score` floor
+    (achado #5) depends on a 0.0 score actually meaning "no relevance," not "word boundary
+    quirk," or every single-word query would spuriously get zero results.
+    """
+
+    _WORD_RE = re.compile(r"\w+")
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
-        query_words = set(query.lower().split())
+        query_words = set(self._WORD_RE.findall(query.lower()))
         if not query_words:
             return [0.0] * len(documents)
 
         scores = []
         for doc in documents:
-            doc_words = set(doc.lower().split())
+            doc_words = set(self._WORD_RE.findall(doc.lower()))
             overlap = len(query_words & doc_words)
             scores.append(overlap / len(query_words))
         return scores
@@ -153,6 +176,7 @@ class Retriever:
         query: str,
         filters: dict | None = None,
         top_k: int = 8,
+        min_score: float = DEFAULT_MIN_RELEVANCE_SCORE,
     ) -> list[RetrievedChunk]:
         """Search collection by query with optional filtering and reranking.
 
@@ -164,9 +188,13 @@ class Retriever:
                                    "merchant_id": "MERCH-01"}
                      - For policies: {"doc": "POL-001", "section": "Limits"}
             top_k: Number of results to return (default 8).
+            min_score: Reranked-score floor (exclusive); candidates at or below it are
+                       dropped rather than padding the result out to `top_k`. See
+                       `DEFAULT_MIN_RELEVANCE_SCORE`'s module-level comment for why the
+                       default is conservative.
 
         Returns:
-            List of RetrievedChunk sorted by reranked score (descending).
+            List of RetrievedChunk sorted by reranked score (descending), score > min_score.
 
         Raises:
             ValueError: If `filters` contains a key not recognized for `collection`.
@@ -196,6 +224,7 @@ class Retriever:
             )
 
         reranked = self._rerank(query, candidates)
+        relevant = [item for item in reranked if item["reranked_score"] > min_score]
 
         result = [
             RetrievedChunk(
@@ -204,7 +233,7 @@ class Retriever:
                 text=item["text"],
                 score=item["reranked_score"],
             )
-            for item in reranked[:top_k]
+            for item in relevant[:top_k]
         ]
 
         logger.info(
@@ -212,6 +241,7 @@ class Retriever:
             collection=collection,
             query_length=len(query),
             candidates=len(candidates),
+            below_min_score=len(reranked) - len(relevant),
             returned=len(result),
         )
 

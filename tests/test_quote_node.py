@@ -46,14 +46,61 @@ def test_computes_amount_as_unit_price_times_quantity(deps):
     assert result.quote_amount_cents == 4999 * 3
 
 
-def test_raises_when_nothing_was_selected(deps):
+# --- achado #2 (scenarios.yaml header): no selection is a legal pause, not an illegal
+# transition — `quote` must never guess, whether retrieve found one candidate or several.
+# `IllegalTransitionError` is now reserved for a `selected_sku` that names something
+# `retrieve` never actually returned (test_raises_when_the_selection_was_never_retrieved
+# below), since that can only happen from an invented/hallucinated selection, not a
+# legitimate "nothing chosen yet" pause.
+
+
+def test_needs_clarification_when_nothing_was_selected_with_one_candidate(deps):
     node = make_quote_node(deps)
     state = PurchaseState(
         user_request="fone bluetooth", retrieved_chunks=[_chunk("SKU-SPEAKER")]
     )
 
-    with pytest.raises(IllegalTransitionError):
-        node(state)
+    result = node(state)
+
+    assert result.status == "needs_clarification"
+    assert result.quote_amount_cents is None
+
+
+def test_needs_clarification_when_nothing_was_selected_with_multiple_candidates(deps):
+    node = make_quote_node(deps)
+    state = PurchaseState(
+        user_request="healthy snack",
+        retrieved_chunks=[_chunk("SKU-SPEAKER"), _chunk("SKU-OTHER"), _chunk("SKU-THIRD")],
+    )
+
+    result = node(state)
+
+    assert result.status == "needs_clarification"
+
+
+def test_needs_clarification_when_nothing_was_selected_and_nothing_was_found(deps):
+    node = make_quote_node(deps)
+    state = PurchaseState(user_request="a genuinely absent product", retrieved_chunks=[])
+
+    result = node(state)
+
+    assert result.status == "needs_clarification"
+
+
+def test_needs_clarification_is_a_legal_pause_not_a_raise(deps):
+    """`quote`'s no-op guard treats needs_clarification like awaiting_step_up: a later
+    re-invocation (once something outside the graph has resolved a selection) must not
+    raise just because the purchase is not `in_progress`."""
+    node = make_quote_node(deps)
+    state = PurchaseState(
+        user_request="fone bluetooth",
+        status="needs_clarification",
+        retrieved_chunks=[_chunk("SKU-SPEAKER")],
+    )
+
+    result = node(state)
+
+    assert result == state
 
 
 def test_raises_when_the_selection_was_never_retrieved(deps):

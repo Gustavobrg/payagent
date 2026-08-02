@@ -157,6 +157,35 @@ def test_deterministic_reranker_keyword_overlap():
     assert scores[0] > scores[2]  # Full overlap beats partial overlap.
 
 
+# --- achado #5 (scenarios.yaml header): retrieval had no relevance floor at all, so a query
+# for something genuinely absent from the catalog still returned top_k unrelated real
+# products instead of signaling "nothing matches." -------------------------------------
+
+
+def test_search_excludes_candidates_with_zero_measured_relevance(retriever: Retriever):
+    """A query sharing no vocabulary at all with any catalog item must not pad results out
+    to top_k with unrelated products — every DeterministicReranker score is exactly 0.0 for
+    zero keyword overlap, and the default `min_score` floor excludes those.
+    """
+    results = retriever.search(CATALOG_COLLECTION, "purple dinosaur umbrella parade", top_k=8)
+
+    assert results == []
+
+
+def test_search_keeps_a_genuine_match_at_the_default_threshold(retriever: Retriever):
+    """The default floor must not be so aggressive it rejects an actual keyword match."""
+    results = retriever.search(CATALOG_COLLECTION, "bluetooth speaker", top_k=8)
+
+    assert any(r.chunk_id == "SKU-SPEAKER" for r in results)
+
+
+def test_search_honors_an_explicit_min_score_override(retriever: Retriever):
+    """Callers can raise the floor above the default to demand stronger matches."""
+    results = retriever.search(CATALOG_COLLECTION, "bluetooth", top_k=8, min_score=1.1)
+
+    assert results == []
+
+
 def test_retrieved_chunk_structure(retriever: Retriever):
     """Test that RetrievedChunk has all required fields."""
     results = retriever.search(CATALOG_COLLECTION, "AuraSound", top_k=3)

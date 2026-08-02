@@ -28,6 +28,12 @@ GraphStatus = Literal[
     "in_progress",
     # `plan` decided the request needs no purchase flow (greeting, out-of-scope question).
     "answered_directly",
+    # `quote` found no `selected_sku` in state — nothing outside the graph has confirmed
+    # which retrieved candidate (zero, one, or many) to price yet. Never inferred from
+    # retrieved prose (I5); like `awaiting_step_up`, a legal pause, not an illegal
+    # transition — `quote` never guesses, so this is the normal outcome until something
+    # outside the graph sets `state.selected_sku` and re-invokes `quote`.
+    "needs_clarification",
     # `quote` node's #get_quote call failed (unknown SKU, out of stock, currency mismatch, ...).
     "quote_failed",
     # `mandate` node's create_intent_mandate/create_payment_mandate was denied. Terminal —

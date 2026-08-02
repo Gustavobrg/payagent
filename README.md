@@ -3,18 +3,18 @@
 > Autonomous purchasing agent with agentic RAG, MCP tools, signed mandates, and layered
 > guardrails (NeMo Guardrails + Llama Guard) — reference implementation.
 
-<!-- BLOCK 11: replace with REAL numbers from the latest eval report. -->
-<!-- The README opens with numbers, never with "this project demonstrates...". -->
+<!-- Numbers from evals/reports/20260801T235606Z_full (150 scenarios, guardrails: full). -->
+<!-- Rerun `uv run python -m evals.harness.run` and update this table when it moves. -->
 
 | Metric | Result |
 |---|---|
-| False settlements (150 scenarios) | — |
-| Injection blocked — via user | — |
-| Injection blocked — via retrieved content (P4) | — |
-| False positive on legitimate purchases | — |
-| PANs in logs | — |
-| Average cost per transaction | — |
-| Latency added by guardrails (p95) | — |
+| False settlements (150 scenarios) | 0% (0/86) |
+| Injection blocked — via user (P1/P2/P3/P5) | 93.2% (41/44) |
+| Injection blocked — via retrieved content (P4, live) | 6.2% (1/16) 🔴 open investigation, see [Known issues](#known-issues) |
+| False positive on legitimate purchases | 0.0% (0/60) |
+| PANs in logs | 0 |
+| Avg tokens per transaction | ~8,932 (no $/token pricing wired up — see [Known issues](#known-issues)) |
+| Latency added by guardrails (p95) | 1,349 ms in / 1,153 ms out (isolated from graph latency) |
 
 ## The problem
 
@@ -70,10 +70,10 @@ See `docs/adr/`. The three central ones:
 | `graph/` — `plan → retrieve → quote → mandate → confirm → settle` | ✅ every node has real logic |
 | `rag/` — retriever, reranking, search sub-agent | ✅ |
 | Demos (`scripts/demo.py` CLI, `scripts/demo_gradio.py` web) | ✅ |
-| `guardrails/dlp.py` (PAN/CVV redaction in logs) | ⏳ stub/passthrough |
-| NeMo rails (`guardrails/*.co`) | ⏳ Colang written, not yet wired into a running rails runtime |
-| Llama Guard / P1–P5 taxonomy classifier | ⏳ not implemented |
-| `evals/harness/` | ⏳ datasets ready under `evals/datasets/`, harness itself not implemented |
+| `guardrails/dlp.py` (PAN/CVV/expiry + generic PII redaction in logs) | ✅ regex+Luhn for card data, Presidio for generic PII |
+| NeMo rails (`guardrails/*.co`) | ✅ wired into a running rails-only `LLMRails` (`build_rails()`); dialog rails deliberately empty, LangGraph drives the conversation |
+| Llama Guard / P1–P5 taxonomy classifier | ✅ live via OpenRouter (`OpenRouterLlamaGuard`, `meta-llama/llama-guard-4-12b`) — safe/unsafe verdict works, but the model returns its own S1–S14 codes, not the custom P1–P5 taxonomy (labeling gap, not a blocking one) |
+| `evals/harness/` | ✅ 150-scenario dataset, full harness (`evals/harness/run.py`), reports under `evals/reports/` |
 | OpenTelemetry / Langfuse | ⏳ dependency installed, no instrumentation yet |
 | `docs/threat-model.md`, `docs/deployment.md` | ⏳ placeholders (block 11) |
 
@@ -100,6 +100,20 @@ uv run python scripts/demo_gradio.py
 uv run python -m payagent.mcp_server
 ```
 
+
+## Known issues
+
+| Issue | Status |
+|---|---|
+| `injection_block_rate`, retrieved content (P4, live): 6.2% (1/16) — vs. 100% (15/15) on an offline heuristic re-scan of the same poisoned SKUs, identical across two independent full runs | 🔴 open investigation — see [ADR-0006](docs/adr/0006-eval.md) |
+
+Exact reproducibility of the 1/16 across two otherwise-different runs points toward a
+consistent code-path issue (most likely the P4 scan not being invoked at the right point
+in context assembly) rather than flaky retrieval ranking — next step is instrumenting a
+`retrieved: bool` field per P4 scenario to separate "never retrieved" from "retrieved but
+not blocked" before attempting a fix. This does not block CI: per ADR-0006 the merge gate
+only trips on `false_settlement_rate > 0` or `pan_leak_count > 0`, both of which have
+stayed at 0 throughout.
 
 ## Scope and non-scope
 - No integration with a real acquirer or card network. Card numbers are test numbers only.

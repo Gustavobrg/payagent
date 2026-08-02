@@ -21,6 +21,10 @@ _STEP_UP_MESSAGE = (
     "Additional confirmation (step-up) is required before this purchase can proceed."
 )
 _FALLBACK_MESSAGE = "I could not complete this request."
+_NOTHING_FOUND_MESSAGE = (
+    "I couldn't find a matching product. Could you tell me more specifically what you're "
+    "looking for?"
+)
 
 
 def compose_response(state: PurchaseState) -> str:
@@ -35,6 +39,15 @@ def compose_response(state: PurchaseState) -> str:
             f"Purchase confirmed: settlement {data['settlement_id']} for "
             f"{data['amount_cents']} {data['currency']}.{citation}"
         )
+
+    if state.status == "needs_clarification":
+        if not state.retrieved_chunks:
+            return _NOTHING_FOUND_MESSAGE
+        # Only chunk_ids are listed, never chunk.text — that text is untrusted retrieved
+        # prose (I5) and echoing it here would be exactly the round trip
+        # untrusted.py::unwrap_untrusted_text's docstring warns against.
+        candidate_ids = ", ".join(chunk.chunk_id for chunk in state.retrieved_chunks)
+        return f"Which of these did you mean: {candidate_ids}?"
 
     if state.status == "quote_failed":
         error = state.quote["error"]

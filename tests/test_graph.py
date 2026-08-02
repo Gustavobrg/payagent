@@ -167,10 +167,14 @@ def test_retrieve_does_not_run_once_plan_has_answered_directly(retriever: Retrie
     assert result.retrieved_chunks == []  # retrieve never ran
 
 
-def test_running_past_retrieve_without_a_confirmed_selection_is_an_illegal_transition(
+def test_running_past_retrieve_without_a_confirmed_selection_needs_clarification(
     retriever: Retriever, deps
 ):
-    """`quote` requires a human-confirmed `selected_sku` — `retrieve` alone never sets one."""
+    """`quote` requires a human-confirmed `selected_sku` — `retrieve` alone never sets one.
+
+    achado #2: this is a legal pause (`needs_clarification`), not an illegal transition —
+    `quote` never guesses which retrieved candidate to price.
+    """
     llm = FakeChatModel(
         responses=[
             _route_to_retrieve(),
@@ -181,8 +185,9 @@ def test_running_past_retrieve_without_a_confirmed_selection_is_an_illegal_trans
     graph = build_graph(llm, retriever, deps)
     state = PurchaseState(user_request="fone bluetooth")
 
-    with pytest.raises(IllegalTransitionError):
-        graph.run(state, through="quote")
+    result = graph.run(state, through="quote")
+
+    assert result.status == "needs_clarification"
 
 
 def test_full_pipeline_settles_when_everything_is_pre_confirmed_and_permissive(

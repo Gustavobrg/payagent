@@ -1,5 +1,15 @@
 # Prompts de classificação do Llama Guard com a taxonomia CUSTOMIZADA do domínio.
 # A taxonomia padrão (S1..S13) não é usada — ver docs/guardrail-taxonomy.md.
+#
+# ATUALMENTE MORTO: `guardrails/actions.py`'s llama_guard_check_input/_output chamam
+# `payagent.guardrails.provider.OpenRouterLlamaGuard` diretamente via HTTP
+# (`/chat/completions`), não o registro de tasks/prompts do NeMo — este arquivo nunca é
+# lido em tempo de execução hoje (mesma situação que o `models:` block de config.yml, ver
+# comentário lá). O formato bruto de completion abaixo (`<|begin_of_text|>[INST]...[/INST]`,
+# sem chat template) é provavelmente o formato certo para fazer o llama-guard-4-12b adotar
+# P1-P5 em vez de S1..S14 (achado #4 do header de scenarios.yaml) — mas isso exige validação
+# ao vivo via scripts/probe_llama_guard.py contra um endpoint de completions bruto antes de
+# reconectar isto a algo. Não editado/removido especulativamente.
 
 prompts:
   - task: llama_guard_check_input

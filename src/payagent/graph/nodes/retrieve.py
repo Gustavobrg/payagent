@@ -29,6 +29,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from payagent.observability.logging import get_logger
+from payagent.rag.context import assemble_context
 from payagent.rag.retriever import Retriever
 from payagent.rag.tools import (
     ToolChunk,
@@ -48,6 +49,11 @@ Your only job is to find chunks — catalog entries and/or policy sections — t
 the request in front of you, using the tools available to you. You decide whether to
 search the catalog, the policies, or both, and in what order. If early results look weak,
 irrelevant, or incomplete, reformulate the query and search again.
+
+`search_catalog` is the entry point for any request to find, browse, describe, or buy a
+product — even a vague one ("a toy for my cat", "something elegant for an event"). Use
+`search_policies` only for questions about rules, eligibility, returns, shipping, or other
+restrictions — never for product discovery, however open-ended the product request is.
 
 You have a hard budget of tool-calling turns for this task. Use them efficiently: stop
 calling tools as soon as you have what's needed, or as soon as you conclude nothing
@@ -304,6 +310,14 @@ def make_retrieve_node(
         outcome = run_retrieval_subagent(
             llm, retriever, state["query"], max_iterations=max_iterations
         )
+        # P4 (docs/guardrail-taxonomy.md achado #3): run the same scan `assemble_context`
+        # uses so a live retrieval actually audit-logs an injected chunk instead of only the
+        # offline unit tests exercising it. The assembled/filtered result itself is discarded
+        # on purpose — `retrieved_chunks` stays the raw list `assemble_context`'s own
+        # docstring requires, since quote/mandate/settle price a purchase from Qdrant's
+        # structured payload, never chunk prose, so a real (if poison-described) SKU must
+        # still be purchasable.
+        assemble_context(outcome.chunks)
         return {"retrieved_chunks": outcome.chunks, "retrieval_confidence": outcome.confidence}
 
     return node

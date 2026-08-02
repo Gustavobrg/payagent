@@ -42,9 +42,15 @@ def make_quote_node(
             return state
 
         if state.selected_sku is None:
-            raise IllegalTransitionError(
-                "quote requires state.selected_sku — nothing has been confirmed to price yet"
+            # achado #2: a legal pause, not an illegal transition — quote never guesses,
+            # whether retrieve found zero, one, or many candidates. Re-entrant: quote's own
+            # no-op guard above (`not state.is_active`) makes a later re-invocation with
+            # still no selection a no-op rather than looping back through this branch.
+            logger.info(
+                "quote_needs_clarification", candidate_count=len(state.retrieved_chunks)
             )
+            return state.model_copy(update={"status": "needs_clarification"})
+
         confirmed_ids = {chunk.chunk_id for chunk in state.retrieved_chunks}
         if state.selected_sku not in confirmed_ids:
             raise IllegalTransitionError(
