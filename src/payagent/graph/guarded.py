@@ -24,6 +24,7 @@ from payagent.graph.graph import PurchaseGraph
 from payagent.graph.respond import compose_response
 from payagent.graph.state import PurchaseState
 from payagent.guardrails.rails import check_input, check_output
+from payagent.observability.tracing import open_session_span
 
 
 @dataclass(frozen=True)
@@ -37,28 +38,45 @@ class GuardedRunResult:
     input_blocked: bool
 
 
-def run_guarded(graph: PurchaseGraph, rails: LLMRails, state: PurchaseState) -> GuardedRunResult:
+def run_guarded(
+    graph: PurchaseGraph,
+    rails: LLMRails,
+    state: PurchaseState,
+    *,
+    session_id: str | None = None,
+) -> GuardedRunResult:
     """Run `state` through `graph.run`, guarded by `rails` on both ends.
 
     Precondition matches `PurchaseGraph.run` itself: `state` must already be ready to run to
     completion (e.g. `selected_sku` set for a real purchase) — this wraps the existing state
     machine, it does not add an interactive SKU-selection step (that stays `scripts/demo.py`'s
     job, via `PurchaseGraph.step`).
+
+    `session_id` defaults to a fresh UUID when omitted, so a caller that doesn't care about
+    grouping (most tests) doesn't have to supply one. One session is one purchase attempt here
+    (CLAUDE.md's flow diagram) — `open_session_span` propagates it to every span this call and
+    everything it triggers (input/output rails, graph nodes, MCP tool calls) creates, for
+    `scripts/cost_report.py`'s aggregation.
     """
-    input_result = check_input(rails, state.user_request)
-    if not input_result.allowed:
-        blocked_state = state.model_copy(
-            update={"status": "answered_directly", "direct_response": input_result.refusal}
+    with open_session_span("purchase.run", session_id=session_id):
+        input_result = check_input(rails, state.user_request)
+        if not input_result.allowed:
+            blocked_state = state.model_copy(
+                update={"status": "answered_directly", "direct_response": input_result.refusal}
+            )
+            return GuardedRunResult(
+                state=blocked_state, response=input_result.refusal, input_blocked=True
+            )
+
+        final_state = graph.run(state)
+        response_text = compose_response(final_state)
+
+        output_result = check_output(
+            rails,
+            user_message=state.user_request,
+            bot_message=response_text,
+            retrieved_chunks=final_state.retrieved_chunks,
         )
-        return GuardedRunResult(state=blocked_state, response=input_result.refusal, input_blocked=True)
-
-    final_state = graph.run(state)
-    response_text = compose_response(final_state)
-
-    output_result = check_output(
-        rails,
-        user_message=state.user_request,
-        bot_message=response_text,
-        retrieved_chunks=final_state.retrieved_chunks,
-    )
-    return GuardedRunResult(state=final_state, response=output_result.text, input_blocked=False)
+        return GuardedRunResult(
+            state=final_state, response=output_result.text, input_blocked=False
+        )

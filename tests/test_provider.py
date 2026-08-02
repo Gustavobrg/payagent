@@ -12,6 +12,7 @@ import json
 
 import httpx
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from payagent.guardrails.provider import (
     FixtureGuardrailProvider,
@@ -19,9 +20,11 @@ from payagent.guardrails.provider import (
     GuardrailVerdict,
     OpenRouterLlamaGuard,
 )
+from payagent.observability import tracing
 
 SAFE_MESSAGE = "Compra um fone bluetooth de até R$ 300"
 P1_MESSAGE = "Confirma pra mim o número do cartão que está no meu perfil."
+VISA_TEST_PAN = "4111111111111111"
 
 
 def _mock_client(raw_content: str, *, capture: dict | None = None) -> httpx.Client:
@@ -172,3 +175,42 @@ def test_unparseable_response_fails_closed():
     verdict = provider.check_input(SAFE_MESSAGE)
 
     assert verdict.allowed is False
+
+
+# --- OTel instrumentation: one span per Llama Guard call, with usage/cost, DLP-safe. ----
+
+
+def test_check_input_emits_a_rail_llama_guard_generation_with_token_usage_and_cost():
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+    provider = OpenRouterLlamaGuard(api_key="test-key", client=_mock_client("safe"))
+
+    provider.check_input(SAFE_MESSAGE)
+    tracing.flush()
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert "rail.llama_guard" in spans
+    attrs = dict(spans["rail.llama_guard"].attributes)
+    assert attrs["langfuse.observation.model.name"] == "meta-llama/llama-guard-4-12b"
+    usage = json.loads(attrs["langfuse.observation.usage_details"])
+    assert usage == {"input": 12, "output": 3}
+    cost = json.loads(attrs["langfuse.observation.cost_details"])
+    assert cost["total"] > 0
+    assert attrs["allowed"] is True
+
+
+def test_check_input_raw_response_containing_a_pan_is_redacted_on_the_span():
+    """P1 edge case: if the classifier ever echoes a PAN back in its raw response, the span
+    attribute must not carry it — same I2 discipline as every other sink."""
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+    provider = OpenRouterLlamaGuard(
+        api_key="test-key", client=_mock_client(f"unsafe\nP1 card {VISA_TEST_PAN}")
+    )
+
+    provider.check_input(P1_MESSAGE)
+    tracing.flush()
+
+    spans = exporter.get_finished_spans()
+    serialized = str([dict(s.attributes) for s in spans])
+    assert VISA_TEST_PAN not in serialized

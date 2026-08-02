@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import sys
 from typing import Any
+from uuid import uuid4
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -38,6 +39,7 @@ from payagent.guardrails.untrusted import unwrap_untrusted_text
 from payagent.mcp_server.__main__ import build_deps_from_env
 from payagent.mcp_server.deps import ToolDeps
 from payagent.observability.logging import configure_logging
+from payagent.observability.tracing import configure_tracing, open_session_span
 
 _deps: ToolDeps | None = None
 _graph: PurchaseGraph | None = None
@@ -183,56 +185,97 @@ def on_start(request: str, session: dict | None):
         yield _done(["Type a request first."], _HIDE_SELECTION, _HIDE_STEP_UP, session)
         return
 
+    # One browser-side purchase attempt is one session (CLAUDE.md: one session = one
+    # purchase). Generated once here and threaded through `session["session_id"]` to later
+    # handlers (each Gradio event handler is its own call, so `open_session_span`'s context
+    # can't stay open across handlers the way `run_guarded`'s single `with` block does for the
+    # CLI/harness paths) — re-entered fresh, with the same `session_id`, in every handler below.
+    session_id = str(uuid4())
     state = PurchaseState(user_request=request)
     log: list[str] = []
 
-    state = graph.step("plan", state)
-    log += _report_lines("plan", state)
-    if state.status == "answered_directly":
-        yield _done(log, _HIDE_SELECTION, _HIDE_STEP_UP, {"state": state, "log": log})
-        return
+    with open_session_span("demo_gradio.on_start", session_id=session_id):
+        state = graph.step("plan", state)
+        log += _report_lines("plan", state)
+        if state.status == "answered_directly":
+            yield _done(
+                log,
+                _HIDE_SELECTION,
+                _HIDE_STEP_UP,
+                {"state": state, "log": log, "session_id": session_id},
+            )
+            return
 
-    yield _thinking(log, note="Searching the catalog...")
+        yield _thinking(log, note="Searching the catalog...")
 
-    state = graph.step("retrieve", state)
-    log += _report_lines("retrieve", state)
-    catalog_hits = [c for c in state.retrieved_chunks if c.source == "catalog"]
-    if not catalog_hits:
-        log.append("Nothing found in the catalog for this request.")
-        yield _done(log, _HIDE_SELECTION, _HIDE_STEP_UP, {"state": state, "log": log})
-        return
+        state = graph.step("retrieve", state)
+        log += _report_lines("retrieve", state)
+        catalog_hits = [c for c in state.retrieved_chunks if c.source == "catalog"]
+        if not catalog_hits:
+            log.append("Nothing found in the catalog for this request.")
+            yield _done(
+                log,
+                _HIDE_SELECTION,
+                _HIDE_STEP_UP,
+                {"state": state, "log": log, "session_id": session_id},
+            )
+            return
 
-    # Gradio's Radio accepts (label, value) pairs: the shopper sees the product, the code
-    # still only ever gets the chunk_id back — the unwrapped prose is display-only (I5).
-    choices = [(f"{c.chunk_id} — {unwrap_untrusted_text(c.text)}", c.chunk_id) for c in catalog_hits]
-    selection = (
-        gr.update(visible=True, choices=choices, value=choices[0][1]),
-        gr.update(visible=True),
-        gr.update(visible=True),
-    )
-    yield _done(log, selection, _HIDE_STEP_UP, {"state": state, "log": log})
+        # Gradio's Radio accepts (label, value) pairs: the shopper sees the product, the code
+        # still only ever gets the chunk_id back — the unwrapped prose is display-only (I5).
+        choices = [
+            (f"{c.chunk_id} — {unwrap_untrusted_text(c.text)}", c.chunk_id) for c in catalog_hits
+        ]
+        selection = (
+            gr.update(visible=True, choices=choices, value=choices[0][1]),
+            gr.update(visible=True),
+            gr.update(visible=True),
+        )
+        yield _done(
+            log,
+            selection,
+            _HIDE_STEP_UP,
+            {"state": state, "log": log, "session_id": session_id},
+        )
 
 
 def _advance_confirm_then_settle(
-    deps: ToolDeps, graph: PurchaseGraph, state: PurchaseState, log: list[str]
+    deps: ToolDeps, graph: PurchaseGraph, state: PurchaseState, log: list[str], session_id: str
 ) -> tuple:
     """Shared tail: run `confirm`, then either pause for step-up or fall through to `settle`."""
-    state = graph.step("confirm", state)
-    log += _report_lines("confirm", state)
+    with open_session_span("demo_gradio.confirm_then_settle", session_id=session_id):
+        state = graph.step("confirm", state)
+        log += _report_lines("confirm", state)
 
-    if state.status == "awaiting_step_up":
-        return _done(log, _HIDE_SELECTION, _SHOW_STEP_UP, {"state": state, "log": log})
-    if state.status != "in_progress":
-        return _done(log, _HIDE_SELECTION, _HIDE_STEP_UP, {"state": state, "log": log})
+        if state.status == "awaiting_step_up":
+            return _done(
+                log,
+                _HIDE_SELECTION,
+                _SHOW_STEP_UP,
+                {"state": state, "log": log, "session_id": session_id},
+            )
+        if state.status != "in_progress":
+            return _done(
+                log,
+                _HIDE_SELECTION,
+                _HIDE_STEP_UP,
+                {"state": state, "log": log, "session_id": session_id},
+            )
 
-    state = graph.step("settle", state)
-    log += _report_lines("settle", state)
-    return _done(log, _HIDE_SELECTION, _HIDE_STEP_UP, {"state": state, "log": log})
+        state = graph.step("settle", state)
+        log += _report_lines("settle", state)
+        return _done(
+            log,
+            _HIDE_SELECTION,
+            _HIDE_STEP_UP,
+            {"state": state, "log": log, "session_id": session_id},
+        )
 
 
 def on_confirm_selection(sku: str, quantity: float, session: dict):
     state: PurchaseState = session["state"]
     log: list[str] = session["log"]
+    session_id: str = session["session_id"]
     yield _thinking(log)
 
     deps, graph = _get_graph()
@@ -240,24 +283,36 @@ def on_confirm_selection(sku: str, quantity: float, session: dict):
         update={"selected_sku": sku, "selected_quantity": int(quantity or 1)}
     )
 
-    state = graph.step("quote", state)
-    log += _report_lines("quote", state)
-    if state.status != "in_progress":
-        yield _done(log, _HIDE_SELECTION, _HIDE_STEP_UP, {"state": state, "log": log})
-        return
+    with open_session_span("demo_gradio.on_confirm_selection", session_id=session_id):
+        state = graph.step("quote", state)
+        log += _report_lines("quote", state)
+        if state.status != "in_progress":
+            yield _done(
+                log,
+                _HIDE_SELECTION,
+                _HIDE_STEP_UP,
+                {"state": state, "log": log, "session_id": session_id},
+            )
+            return
 
-    state = graph.step("mandate", state)
-    log += _report_lines("mandate", state)
-    if state.status != "in_progress":
-        yield _done(log, _HIDE_SELECTION, _HIDE_STEP_UP, {"state": state, "log": log})
-        return
+        state = graph.step("mandate", state)
+        log += _report_lines("mandate", state)
+        if state.status != "in_progress":
+            yield _done(
+                log,
+                _HIDE_SELECTION,
+                _HIDE_STEP_UP,
+                {"state": state, "log": log, "session_id": session_id},
+            )
+            return
 
-    yield _advance_confirm_then_settle(deps, graph, state, log)
+    yield _advance_confirm_then_settle(deps, graph, state, log, session_id)
 
 
 def on_approve_step_up(session: dict):
     state: PurchaseState = session["state"]
     log: list[str] = session["log"]
+    session_id: str = session["session_id"]
     yield _thinking(log, note="Checking step-up...")
 
     deps, graph = _get_graph()
@@ -267,7 +322,7 @@ def on_approve_step_up(session: dict):
     deps.step_up.resolve_challenge(challenge.challenge_id, now=now)
     log.append("_Step-up approved via the out-of-band channel._")
 
-    yield _advance_confirm_then_settle(deps, graph, state, log)
+    yield _advance_confirm_then_settle(deps, graph, state, log, session_id)
 
 
 def on_decline_step_up(session: dict) -> tuple:
@@ -276,8 +331,14 @@ def on_decline_step_up(session: dict) -> tuple:
     stays a plain function rather than a generator."""
     state: PurchaseState = session["state"]
     log: list[str] = session["log"]
+    session_id: str = session["session_id"]
     log.append("_Step-up declined. The purchase remains paused._")
-    return _done(log, _HIDE_SELECTION, _SHOW_STEP_UP, {"state": state, "log": log})
+    return _done(
+        log,
+        _HIDE_SELECTION,
+        _SHOW_STEP_UP,
+        {"state": state, "log": log, "session_id": session_id},
+    )
 
 
 # -------------------------------------------------------------------------------------- UI
@@ -330,6 +391,7 @@ def build_ui() -> gr.Blocks:
 def main() -> None:
     load_dotenv()
     configure_logging(stream=sys.stderr)
+    configure_tracing()
     build_ui().queue().launch()
 
 

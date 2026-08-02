@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from payagent.graph.state import PurchaseState
 from payagent.observability.logging import get_logger
+from payagent.observability.tracing import traced_llm_invoke
 
 logger = get_logger(__name__)
 
@@ -120,7 +121,7 @@ def make_plan_node(llm: ChatModel) -> Callable[[PurchaseState], PurchaseState]:
         ]
 
         try:
-            ai_message = bound_llm.invoke(messages)
+            ai_message = traced_llm_invoke(llm, bound_llm, messages)
             call = next(
                 (c for c in (ai_message.tool_calls or []) if c["name"] == _ROUTE_TOOL_NAME),
                 None,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 from nemoguardrails import LLMRails
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from payagent.guardrails import provider as guardrail_provider
 from payagent.guardrails.provider import (
@@ -22,6 +23,7 @@ from payagent.guardrails.provider import (
     GuardrailVerdict,
 )
 from payagent.guardrails.rails import build_rails, check_input, check_output
+from payagent.observability import tracing
 from payagent.rag.tools import ToolChunk
 
 SAFE_MESSAGE = "Compra um fone bluetooth de até R$ 300"
@@ -128,3 +130,52 @@ def test_check_output_grounded_citation_passes(permissive_rails: LLMRails):
 
     assert result.blocked is False
     assert result.text == "Custa R$129,99 [[SKU-HEADPHONES]]."
+
+
+# --- OTel instrumentation: rail.check_input/output spans, with the three named actions
+# nesting underneath (NOT safe by inspection — NeMo dispatches actions through its own
+# internal async machinery, a different framework's event loop than this codebase's own).
+
+
+def test_check_input_emits_a_rail_check_input_span(rails: LLMRails):
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+
+    check_input(rails, SAFE_MESSAGE)
+    tracing.flush()
+
+    span_names = {s.name for s in exporter.get_finished_spans()}
+    assert "rail.check_input" in span_names
+
+
+def test_check_output_emits_a_rail_check_output_span(permissive_rails: LLMRails):
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+
+    check_output(permissive_rails, user_message="oi", bot_message="Olá!")
+    tracing.flush()
+
+    span_names = {s.name for s in exporter.get_finished_spans()}
+    assert "rail.check_output" in span_names
+
+
+def test_input_rail_action_spans_nest_under_rail_check_input(rails: LLMRails):
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+
+    check_input(rails, SAFE_MESSAGE)
+    tracing.flush()
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    parent = spans["rail.check_input"]
+    for child_name in (
+        "rail.dlp_scan_input",
+        "rail.heuristic_injection_check",
+        "rail.llama_guard_check_input",
+    ):
+        assert child_name in spans, f"{child_name} missing from exported spans"
+        child = spans[child_name]
+        assert child.parent is not None, f"{child_name} has no parent span"
+        assert child.parent.span_id == parent.context.span_id, (
+            f"{child_name} did not nest under rail.check_input"
+        )

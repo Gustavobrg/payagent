@@ -32,6 +32,7 @@ from payagent.graph.nodes.retrieve import (
 from payagent.graph.nodes.settle import make_settle_node
 from payagent.graph.state import IllegalTransitionError, PurchaseState
 from payagent.mcp_server.deps import ToolDeps
+from payagent.observability.tracing import wrap_node_span
 from payagent.rag.retriever import Retriever
 
 __all__ = [
@@ -79,7 +80,10 @@ class PurchaseGraph:
         missing = set(NODE_ORDER) - set(nodes)
         if missing:
             raise IllegalTransitionError(f"graph is missing node(s): {sorted(missing)}")
-        self._nodes = nodes
+        # Every node call, on both `.run()` and `.step()`, passes through `self._nodes[name]`
+        # — wrapping here (rather than in each node module) is the single choke point that
+        # gives every invocation path a `graph.<node_name>` OTel span for free.
+        self._nodes = {name: wrap_node_span(name, nodes[name]) for name in NODE_ORDER}
 
     def run(self, state: PurchaseState, *, through: str | None = None) -> PurchaseState:
         """Run all steps from `plan` onward, stopping after `through` (inclusive) if given.

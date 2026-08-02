@@ -80,6 +80,12 @@ from payagent.mcp_server.merchant_sim import MerchantSim
 from payagent.mcp_server.quotes import InMemoryQuoteStore
 from payagent.mcp_server.step_up import InMemoryStepUpVerifier
 from payagent.observability.logging import configure_logging
+from payagent.observability.tracing import (
+    JsonLinesSpanExporter,
+    client_with_exporter,
+    configure_tracing,
+    open_session_span,
+)
 
 
 def new_session_deps(base: ToolDeps) -> ToolDeps:
@@ -404,6 +410,15 @@ def main(argv: list[str] | None = None) -> int:
 
     log_capture = LogCapture(out_dir / f"{run_id}.log")
     configure_logging(stream=log_capture)
+    # Local trace artifact alongside the existing .json/.md/.log report files — a dedicated
+    # Langfuse client whose sole span destination is this file, independent of whether live
+    # Langfuse credentials are configured, so `scripts/cost_report.py` has something
+    # deterministic and offline to aggregate regardless of environment.
+    configure_tracing(
+        client=client_with_exporter(
+            JsonLinesSpanExporter(str(out_dir / f"{run_id}.spans.jsonl"))
+        )
+    )
 
     if args.no_guardrails:
         _apply_no_guardrails_ablation()
@@ -432,7 +447,16 @@ def main(argv: list[str] | None = None) -> int:
     def _run_indexed(index: int, scenario: Scenario) -> tuple[int, ScenarioResult]:
         scenario_deps = new_session_deps(deps)
         scenario_graph = build_graph(llm, scenario_deps.retriever, scenario_deps)
-        return index, run_one_scenario(scenario, scenario_graph, rails, tracer, log_capture)
+        # Entered here, on the worker thread that actually executes the scenario — not on
+        # the submitting thread — since `contextvars` (which `open_session_span` is built on)
+        # does not propagate across `ThreadPoolExecutor.submit()` the way it does across
+        # `asyncio.create_task`. Mirrors how `run_one_scenario` itself binds/unbinds
+        # `structlog.contextvars` around its own body for the same reason. One scenario is
+        # one session (one purchase attempt, CLAUDE.md's flow diagram) — same helper
+        # `run_guarded`/`scripts/demo.py`/`scripts/demo_gradio.py` use for their own root span.
+        with open_session_span("harness.scenario", session_id=scenario.id):
+            result = run_one_scenario(scenario, scenario_graph, rails, tracer, log_capture)
+        return index, result
 
     with patch_rag_tool_tracing(tracer), patch_mcp_handler_tracing(tracer), ThreadPoolExecutor(
         max_workers=args.workers

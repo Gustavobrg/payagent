@@ -33,6 +33,7 @@ from typing import Any
 
 from nemoguardrails import LLMRails, RailsConfig
 
+from payagent.observability.tracing import set_safe_io, start_span
 from payagent.rag.tools import ToolChunk
 
 _CONFIG_PATH = Path(__file__).resolve().parents[3] / "guardrails"
@@ -73,16 +74,20 @@ def _was_blocked(response: Any) -> bool:
 
 def check_input(rails: LLMRails, user_message: str) -> InputCheckResult:
     """Run only the input rails against `user_message`. Never touches the purchase graph."""
-    response = rails.generate(
-        messages=[{"role": "user", "content": user_message}],
-        options={
-            "rails": {"input": True, "output": False, "dialog": False, "retrieval": False},
-            "log": _LOG_OPTIONS,
-        },
-    )
-    if _was_blocked(response):
-        return InputCheckResult(allowed=False, refusal=response.response[0]["content"])
-    return InputCheckResult(allowed=True)
+    with start_span("rail.check_input") as span:
+        response = rails.generate(
+            messages=[{"role": "user", "content": user_message}],
+            options={
+                "rails": {"input": True, "output": False, "dialog": False, "retrieval": False},
+                "log": _LOG_OPTIONS,
+            },
+        )
+        if _was_blocked(response):
+            result = InputCheckResult(allowed=False, refusal=response.response[0]["content"])
+        else:
+            result = InputCheckResult(allowed=True)
+        set_safe_io(span, input=user_message, output={"allowed": result.allowed, "refusal": result.refusal})
+        return result
 
 
 def check_output(
@@ -101,15 +106,24 @@ def check_output(
     # (nemoguardrails/rails/llm/utils.py) — a raw ToolChunk isn't serializable, so only
     # what grounding_check (guardrails/actions.py) actually needs crosses the wire.
     chunk_refs = [{"chunk_id": chunk.chunk_id} for chunk in retrieved_chunks]
-    response = rails.generate(
-        messages=[
-            {"role": "context", "content": {"retrieved_chunks": chunk_refs}},
-            {"role": "user", "content": user_message},
-            {"role": "assistant", "content": bot_message},
-        ],
-        options={
-            "rails": {"input": False, "output": True, "dialog": False, "retrieval": False},
-            "log": _LOG_OPTIONS,
-        },
-    )
-    return OutputCheckResult(text=response.response[0]["content"], blocked=_was_blocked(response))
+    with start_span("rail.check_output") as span:
+        response = rails.generate(
+            messages=[
+                {"role": "context", "content": {"retrieved_chunks": chunk_refs}},
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": bot_message},
+            ],
+            options={
+                "rails": {"input": False, "output": True, "dialog": False, "retrieval": False},
+                "log": _LOG_OPTIONS,
+            },
+        )
+        result = OutputCheckResult(
+            text=response.response[0]["content"], blocked=_was_blocked(response)
+        )
+        set_safe_io(
+            span,
+            input={"user_message": user_message, "bot_message": bot_message},
+            output={"text": result.text, "blocked": result.blocked},
+        )
+        return result

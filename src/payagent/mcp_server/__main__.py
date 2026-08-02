@@ -47,6 +47,7 @@ from payagent.mcp_server.registry import TOOL_SPECS
 from payagent.mcp_server.server import build_server
 from payagent.mcp_server.step_up import InMemoryStepUpVerifier
 from payagent.observability.logging import configure_logging, get_logger
+from payagent.observability.tracing import configure_tracing
 from payagent.policy import DenyAllPolicyEngine, PolicyEngine, RulesPolicyEngine
 from payagent.rag.retriever import Retriever
 
@@ -190,6 +191,7 @@ def main() -> None:
     # constructing the retriever emits a log line. Passing an explicit stream reconfigures even
     # though importing this module's dependencies already configured logging with stdout.
     configure_logging(stream=sys.stderr)
+    configure_tracing()
 
     deps = build_deps_from_env()
     logger.info(

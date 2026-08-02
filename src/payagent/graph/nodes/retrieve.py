@@ -29,6 +29,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from payagent.observability.logging import get_logger
+from payagent.observability.tracing import traced_llm_invoke
 from payagent.rag.context import assemble_context
 from payagent.rag.retriever import Retriever
 from payagent.rag.tools import (
@@ -246,7 +247,7 @@ def run_retrieval_subagent(
     for _ in range(max_iterations):
         iterations_used += 1
         try:
-            ai_message = bound_llm.invoke(messages)
+            ai_message = traced_llm_invoke(llm, bound_llm, messages)
         except Exception as exc:
             logger.warning("retrieve_subagent_llm_error", error=str(exc), iteration=iterations_used)
             break

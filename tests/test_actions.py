@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import actions
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from payagent.guardrails.provider import FixtureGuardrailProvider
+from payagent.observability import tracing
 from payagent.rag.tools import ToolChunk
 
 SAFE_MESSAGE = "Compra um fone bluetooth de até R$ 300"
@@ -151,3 +153,53 @@ async def test_audit_log_redaction_runs_without_error():
     result = await actions.audit_log_redaction(context=None)
 
     assert result == {}
+
+
+# --- OTel instrumentation: one span per named rail action, DLP-safe. -----------------
+
+
+async def test_each_of_the_six_named_actions_emits_its_own_rail_span():
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+
+    await actions.dlp_scan_input(context={"user_message": SAFE_MESSAGE})
+    await actions.heuristic_injection_check(context={"user_message": SAFE_MESSAGE})
+    await actions.llama_guard_check_input(context={"user_message": SAFE_MESSAGE})
+    await actions.grounding_check(context={"bot_message": SAFE_MESSAGE, "retrieved_chunks": []})
+    await actions.llama_guard_check_output(context={"bot_message": SAFE_MESSAGE})
+    await actions.dlp_mask_output(context={"bot_message": SAFE_MESSAGE})
+    tracing.flush()
+
+    span_names = {s.name for s in exporter.get_finished_spans()}
+    assert span_names == {
+        "rail.dlp_scan_input",
+        "rail.heuristic_injection_check",
+        "rail.llama_guard_check_input",
+        "rail.grounding_check",
+        "rail.llama_guard_check_output",
+        "rail.dlp_mask_output",
+    }
+
+
+async def test_dlp_scan_input_pan_never_appears_on_its_span():
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+
+    await actions.dlp_scan_input(context={"user_message": f"cartão {VISA_TEST_PAN}"})
+    tracing.flush()
+
+    spans = exporter.get_finished_spans()
+    serialized = str([dict(s.attributes) for s in spans])
+    assert VISA_TEST_PAN not in serialized
+
+
+async def test_dlp_mask_output_redacted_text_never_appears_raw_on_its_span():
+    exporter = InMemorySpanExporter()
+    tracing.configure_tracing(client=tracing.client_with_exporter(exporter), force=True)
+
+    await actions.dlp_mask_output(context={"bot_message": f"seu cartão é {VISA_TEST_PAN}"})
+    tracing.flush()
+
+    spans = exporter.get_finished_spans()
+    serialized = str([dict(s.attributes) for s in spans])
+    assert VISA_TEST_PAN not in serialized

@@ -21,6 +21,7 @@ from payagent.guardrails import dlp, heuristics
 from payagent.guardrails import provider as guardrail_provider
 from payagent.guardrails.provider import GuardrailProvider
 from payagent.observability.logging import get_logger
+from payagent.observability.tracing import set_safe_attributes, set_safe_io, start_span
 from payagent.rag.context import verify_citations
 from payagent.rag.tools import ToolChunk
 
@@ -59,26 +60,40 @@ def set_guardrail_provider(provider: GuardrailProvider | None) -> None:
 @action(name="dlp_scan_input")
 async def dlp_scan_input(context: dict | None = None) -> dict:
     """P1: orchestrates `payagent.guardrails.dlp.scan` over the user's message."""
-    user_message = (context or {}).get("user_message", "")
-    result = dlp.scan(user_message)
-    has_card_data = any(match.category in _CARD_CATEGORIES for match in result.matches)
-    return {"has_card_data": has_card_data, "categories": list(result.categories)}
+    with start_span("rail.dlp_scan_input") as span:
+        user_message = (context or {}).get("user_message", "")
+        result = dlp.scan(user_message)
+        has_card_data = any(match.category in _CARD_CATEGORIES for match in result.matches)
+        response = {"has_card_data": has_card_data, "categories": list(result.categories)}
+        set_safe_attributes(span, has_card_data=has_card_data, categories=list(result.categories))
+        set_safe_io(span, input=user_message, output=response)
+        return response
 
 
 @action(name="heuristic_injection_check")
 async def heuristic_injection_check(context: dict | None = None) -> dict:
     """P4: orchestrates `payagent.guardrails.heuristics.scan` over the user's message."""
-    user_message = (context or {}).get("user_message", "")
-    result = heuristics.scan(user_message)
-    return {"blocked": result.blocked, "patterns": list(result.patterns)}
+    with start_span("rail.heuristic_injection_check") as span:
+        user_message = (context or {}).get("user_message", "")
+        result = heuristics.scan(user_message)
+        response = {"blocked": result.blocked, "patterns": list(result.patterns)}
+        set_safe_attributes(span, blocked=result.blocked, patterns=list(result.patterns))
+        set_safe_io(span, input=user_message, output=response)
+        return response
 
 
 @action(name="llama_guard_check_input")
 async def llama_guard_check_input(context: dict | None = None) -> dict:
     """P1-P5: orchestrates `GuardrailProvider.check_input` over the user's message."""
-    user_message = (context or {}).get("user_message", "")
-    verdict = _get_provider().check_input(user_message)
-    return {"allowed": verdict.allowed, "policy_violations": list(verdict.categories)}
+    with start_span("rail.llama_guard_check_input") as span:
+        user_message = (context or {}).get("user_message", "")
+        verdict = _get_provider().check_input(user_message)
+        response = {"allowed": verdict.allowed, "policy_violations": list(verdict.categories)}
+        set_safe_attributes(
+            span, allowed=verdict.allowed, policy_violations=list(verdict.categories)
+        )
+        set_safe_io(span, input=user_message, output=response)
+        return response
 
 
 def _as_tool_chunk(item: ToolChunk | dict) -> ToolChunk:
@@ -94,27 +109,41 @@ def _as_tool_chunk(item: ToolChunk | dict) -> ToolChunk:
 @action(name="grounding_check")
 async def grounding_check(context: dict | None = None) -> dict:
     """I4: orchestrates `rag.context.verify_citations` over the bot's message."""
-    ctx = context or {}
-    bot_message = ctx.get("bot_message", "")
-    retrieved_chunks = [_as_tool_chunk(item) for item in ctx.get("retrieved_chunks", [])]
-    invalid = verify_citations(bot_message, retrieved_chunks)
-    return {"grounded": not invalid, "invalid_citations": invalid}
+    with start_span("rail.grounding_check") as span:
+        ctx = context or {}
+        bot_message = ctx.get("bot_message", "")
+        retrieved_chunks = [_as_tool_chunk(item) for item in ctx.get("retrieved_chunks", [])]
+        invalid = verify_citations(bot_message, retrieved_chunks)
+        response = {"grounded": not invalid, "invalid_citations": invalid}
+        set_safe_attributes(span, grounded=not invalid, invalid_citations=invalid)
+        set_safe_io(span, input=bot_message, output=response)
+        return response
 
 
 @action(name="llama_guard_check_output")
 async def llama_guard_check_output(context: dict | None = None) -> dict:
     """P1/P3/P6: orchestrates `GuardrailProvider.check_output` over the bot's message."""
-    bot_message = (context or {}).get("bot_message", "")
-    verdict = _get_provider().check_output(bot_message)
-    return {"allowed": verdict.allowed, "policy_violations": list(verdict.categories)}
+    with start_span("rail.llama_guard_check_output") as span:
+        bot_message = (context or {}).get("bot_message", "")
+        verdict = _get_provider().check_output(bot_message)
+        response = {"allowed": verdict.allowed, "policy_violations": list(verdict.categories)}
+        set_safe_attributes(
+            span, allowed=verdict.allowed, policy_violations=list(verdict.categories)
+        )
+        set_safe_io(span, input=bot_message, output=response)
+        return response
 
 
 @action(name="dlp_mask_output")
 async def dlp_mask_output(context: dict | None = None) -> dict:
     """I2: orchestrates `payagent.guardrails.dlp.mask` over the bot's message."""
-    bot_message = (context or {}).get("bot_message", "")
-    masked, redacted = dlp.mask(bot_message)
-    return {"text": masked, "redacted": redacted}
+    with start_span("rail.dlp_mask_output") as span:
+        bot_message = (context or {}).get("bot_message", "")
+        masked, redacted = dlp.mask(bot_message)
+        response = {"text": masked, "redacted": redacted}
+        set_safe_attributes(span, redacted=redacted)
+        set_safe_io(span, input=bot_message, output=response)
+        return response
 
 
 @action(name="audit_log_redaction")

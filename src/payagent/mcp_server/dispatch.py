@@ -48,6 +48,7 @@ from payagent.mcp_server.idempotency import (
 )
 from payagent.mcp_server.registry import TOOL_SPECS_BY_NAME, ToolSpec
 from payagent.observability.logging import get_logger
+from payagent.observability.tracing import set_safe_attributes, set_safe_io, start_span
 
 logger = get_logger(__name__)
 
@@ -92,6 +93,32 @@ def _error_result(error: ToolErrorPayload, *, replayed: bool = False) -> types.C
     )
 
 
+def _annotate_span_from_result(span: Any, result: types.CallToolResult) -> None:
+    """Read the closed set of safe fields off an already-built `CallToolResult` envelope and
+    set them on the span — never re-derives anything from `arguments`/`request` (I2).
+
+    `denial` fields are `None` (and so silently dropped by `set_safe_attributes`, which
+    already skips `None` values) whenever there's no policy denial in `error` — no need to
+    branch on `denial`'s presence here as well.
+
+    The same closed set is also set as the span's native `output` (via `set_safe_io`) so it
+    renders in Langfuse's Preview panel — still the closed set, never the full envelope's
+    `data`, honoring this module's own "never `arguments`/`request.model_dump()`" discipline.
+    """
+    payload = result.structured_content or {}
+    error = payload.get("error") or {}
+    denial = error.get("denial") or {}
+    fields = {
+        "ok": payload.get("ok"),
+        "error.code": error.get("code"),
+        "denial.code": denial.get("code"),
+        "denial.policy_ref": denial.get("policy_ref"),
+        "replayed": bool(result.meta and result.meta.get(REPLAY_META_KEY)),
+    }
+    set_safe_attributes(span, **fields)
+    set_safe_io(span, output=fields)
+
+
 def _run_handler(deps: ToolDeps, spec: ToolSpec, request: BaseModel) -> dict[str, Any]:
     """Invoke the handler and render its envelope, or raise `HandlerFailure`."""
     result = HANDLERS[spec.name](deps, request)
@@ -119,34 +146,66 @@ async def dispatch_tool_call(
         logger.warning("unknown_tool", tool=name)
         raise MCPError(types.INVALID_PARAMS, "Unknown tool.")
 
-    try:
-        request = spec.request_model.model_validate(arguments or {})
-    except ValidationError as exc:
-        error = from_validation_error(exc)
+    # Single funnel, single span: covers both the graph path (tool_call.call_tool ->
+    # anyio.run) and the live MCP server path (server.py's on_call_tool). Attributes set
+    # below are exactly the closed set this module's own docstring already allows in its
+    # `logger.*` calls (invariant I2) — never `arguments`, `request.model_dump()`, or a
+    # ValidationError's interpolated `msg`.
+    with start_span(f"mcp.tool.{name}", tool=name) as span:
+        try:
+            request = spec.request_model.model_validate(arguments or {})
+        except ValidationError as exc:
+            error = from_validation_error(exc)
+            logger.info(
+                "tool_validation_failed",
+                tool=spec.name,
+                field_paths=[fe.path for fe in error.field_errors],
+                field_codes=[fe.code for fe in error.field_errors],
+            )
+            validation_fields = {
+                "field_paths": [fe.path for fe in error.field_errors],
+                "field_codes": [fe.code for fe in error.field_errors],
+                "ok": False,
+                "error.code": error.code.value,
+            }
+            set_safe_attributes(span, **validation_fields)
+            set_safe_io(span, input={"tool": name}, output=validation_fields)
+            return _error_result(error)
+
+        payload = request.model_dump(mode="json")
+        fingerprint = argument_fingerprint(payload)
+        idempotency_key: str | None = payload.get("idempotency_key")
+
         logger.info(
-            "tool_validation_failed",
+            "tool_call_start",
             tool=spec.name,
-            field_paths=[fe.path for fe in error.field_errors],
-            field_codes=[fe.code for fe in error.field_errors],
+            has_idempotency_key=idempotency_key is not None,
+            arg_fingerprint=fingerprint,
         )
-        return _error_result(error)
+        input_fields = {
+            "tool": name,
+            "arg_fingerprint": fingerprint,
+            "has_idempotency_key": idempotency_key is not None,
+            "idempotency_key": idempotency_key,
+        }
+        set_safe_attributes(
+            span,
+            arg_fingerprint=fingerprint,
+            has_idempotency_key=idempotency_key is not None,
+            idempotency_key=idempotency_key,
+        )
+        set_safe_io(span, input=input_fields)
 
-    payload = request.model_dump(mode="json")
-    fingerprint = argument_fingerprint(payload)
-    idempotency_key: str | None = payload.get("idempotency_key")
+        if not spec.has_side_effect:
+            result = _dispatch_without_idempotency(deps, spec, request)
+        else:
+            assert idempotency_key is not None  # guaranteed by the schema for side-effect tools
+            result = _dispatch_with_idempotency(
+                deps, spec, request, idempotency_key, fingerprint
+            )
 
-    logger.info(
-        "tool_call_start",
-        tool=spec.name,
-        has_idempotency_key=idempotency_key is not None,
-        arg_fingerprint=fingerprint,
-    )
-
-    if not spec.has_side_effect:
-        return _dispatch_without_idempotency(deps, spec, request)
-
-    assert idempotency_key is not None  # guaranteed by the schema for side-effect tools
-    return _dispatch_with_idempotency(deps, spec, request, idempotency_key, fingerprint)
+        _annotate_span_from_result(span, result)
+        return result
 
 
 def _dispatch_without_idempotency(

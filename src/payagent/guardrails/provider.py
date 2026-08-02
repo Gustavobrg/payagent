@@ -38,6 +38,12 @@ from pathlib import Path
 import httpx
 
 from payagent.observability.logging import get_logger
+from payagent.observability.tracing import (
+    record_llm_usage,
+    set_safe_attributes,
+    set_safe_io,
+    start_generation,
+)
 
 logger = get_logger(__name__)
 
@@ -205,24 +211,44 @@ class OpenRouterLlamaGuard(GuardrailProvider):
         return self._check(build_output_prompt(text))
 
     def _check(self, prompt: str) -> GuardrailVerdict:
-        response = self._client.post(
-            OPENROUTER_URL,
-            headers={"Authorization": f"Bearer {self._api_key}"},
-            json={
-                "model": self._model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-            },
-        )
-        response.raise_for_status()
-        raw = response.json()["choices"][0]["message"]["content"]
-        allowed, categories = parse_llama_guard_response(raw)
-        if allowed is None:
-            # Fail closed: an unparseable classifier response is treated as unsafe rather
-            # than silently letting the message through.
-            logger.warning("llama_guard_unparseable_response", raw_response=raw)
-            allowed = False
-        return GuardrailVerdict(allowed=allowed, categories=categories, raw_response=raw)
+        with start_generation("rail.llama_guard", model=self._model) as gen:
+            response = self._client.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json={
+                    "model": self._model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                },
+            )
+            response.raise_for_status()
+            body = response.json()
+            raw = body["choices"][0]["message"]["content"]
+            usage = body.get("usage") or {}
+            record_llm_usage(
+                gen,
+                model=self._model,
+                input_tokens=usage.get("prompt_tokens"),
+                output_tokens=usage.get("completion_tokens"),
+            )
+            allowed, categories = parse_llama_guard_response(raw)
+            if allowed is None:
+                # Fail closed: an unparseable classifier response is treated as unsafe rather
+                # than silently letting the message through.
+                logger.warning("llama_guard_unparseable_response", raw_response=raw)
+                allowed = False
+            # `raw_response` is model output and could in principle echo back sensitive
+            # input — routed through `set_safe_attributes` like every other span attribute,
+            # never set directly (I2).
+            set_safe_attributes(
+                gen, allowed=allowed, categories=list(categories), raw_response=raw
+            )
+            set_safe_io(
+                gen,
+                input=prompt,
+                output={"allowed": allowed, "categories": list(categories), "raw_response": raw},
+            )
+            return GuardrailVerdict(allowed=allowed, categories=categories, raw_response=raw)
 
 
 class FixtureGuardrailProvider(GuardrailProvider):

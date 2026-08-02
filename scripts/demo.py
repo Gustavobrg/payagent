@@ -40,6 +40,7 @@ from payagent.graph.graph import build_graph
 from payagent.graph.state import PurchaseState
 from payagent.mcp_server.__main__ import build_deps_from_env
 from payagent.observability.logging import configure_logging
+from payagent.observability.tracing import configure_tracing, open_session_span
 
 _OUTCOME_BY_STATUS = {
     "answered_directly": None,
@@ -158,44 +159,48 @@ def run_demo(request: str) -> PurchaseState:
     llm = _build_llm()
     graph = build_graph(llm, deps.retriever, deps)
 
-    state = PurchaseState(user_request=request)
+    # One demo invocation is one session (one purchase) — `run_guarded` isn't used here (this
+    # script drives the graph step by step for the interactive SKU/step-up prompts), so the
+    # root span/session are opened directly here via the same shared helper `run_guarded` uses.
+    with open_session_span("demo.purchase"):
+        state = PurchaseState(user_request=request)
 
-    state = graph.step("plan", state)
-    _report("plan", state)
-    if state.status == "answered_directly":
+        state = graph.step("plan", state)
+        _report("plan", state)
+        if state.status == "answered_directly":
+            return state
+
+        state = graph.step("retrieve", state)
+        _report("retrieve", state)
+        if not state.retrieved_chunks:
+            return state
+
+        sku, quantity = _prompt_sku(state)
+        state = state.model_copy(update={"selected_sku": sku, "selected_quantity": quantity})
+
+        state = graph.step("quote", state)
+        _report("quote", state)
+        if state.status != "in_progress":
+            return state
+
+        state = graph.step("mandate", state)
+        _report("mandate", state)
+        if state.status != "in_progress":
+            return state
+
+        while True:
+            state = graph.step("confirm", state)
+            _report("confirm", state)
+            if state.status != "awaiting_step_up":
+                break
+            _resolve_step_up_out_of_band(deps)
+
+        if state.status != "in_progress":
+            return state
+
+        state = graph.step("settle", state)
+        _report("settle", state)
         return state
-
-    state = graph.step("retrieve", state)
-    _report("retrieve", state)
-    if not state.retrieved_chunks:
-        return state
-
-    sku, quantity = _prompt_sku(state)
-    state = state.model_copy(update={"selected_sku": sku, "selected_quantity": quantity})
-
-    state = graph.step("quote", state)
-    _report("quote", state)
-    if state.status != "in_progress":
-        return state
-
-    state = graph.step("mandate", state)
-    _report("mandate", state)
-    if state.status != "in_progress":
-        return state
-
-    while True:
-        state = graph.step("confirm", state)
-        _report("confirm", state)
-        if state.status != "awaiting_step_up":
-            break
-        _resolve_step_up_out_of_band(deps)
-
-    if state.status != "in_progress":
-        return state
-
-    state = graph.step("settle", state)
-    _report("settle", state)
-    return state
 
 
 def main() -> None:
@@ -205,6 +210,7 @@ def main() -> None:
 
     load_dotenv()
     configure_logging(stream=sys.stderr)
+    configure_tracing()
 
     run_demo(args.pedido)
 
